@@ -30,16 +30,7 @@ pnpm test
 The Herdr-backed integration suite runs against a local Unix-socket mock server:
 
 ```bash
-cd packages/pi-herdr-background-terminal && bun service.integration.ts
-```
-
-## Releasing
-
-Packages version independently. To publish a package, tag the tip of `main` with `<package-name>-v<version>` and push the tag; GitHub Actions publishes the matching workspace to npm.
-
-```bash
-git tag pi-herdr-background-terminal-v0.1.3
-git push origin pi-herdr-background-terminal-v0.1.3
+cd packages/pi-herdr-background-terminal && node --experimental-transform-types service.integration.ts
 ```
 
 ## License

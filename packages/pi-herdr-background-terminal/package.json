@@ -3,6 +3,7 @@
   "version": "0.1.2",
   "description": "A Pi extension for running persistent background terminal tasks through Herdr.",
   "type": "module",
+  "main": "./index.ts",
   "license": "MIT",
   "repository": {
     "type": "git",

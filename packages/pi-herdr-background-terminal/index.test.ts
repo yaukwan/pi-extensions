@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { test } from "node:test";
+import assert from "node:assert/strict";
 import { mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,8 +50,8 @@ test("dual marker wrapper separates task output from pane noise", () => {
 	const token = markerToken();
 	const pair = markers(token);
 	const wrapped = wrapCommand("echo hello", token);
-	expect(wrapped).toContain(pair.start);
-	expect(wrapped).toContain(pair.done);
+	assert.ok(wrapped.includes(pair.start));
+	assert.ok(wrapped.includes(pair.done));
 	const fixture = [
 		"$ ( set +e",
 		`); rc=$?`,
@@ -63,34 +64,34 @@ test("dual marker wrapper separates task output from pane noise", () => {
 		"$ ",
 	].join("\n");
 	const parsed = parseTaskOutput(fixture, token);
-	expect(parsed).toEqual({ started: true, output: "real output\nsecond line", exitCode: 7 });
-	for (const leaked of ["( set +e", "); rc=$?", "__PI_BG_DONE_", "printf '\\n", "exit \"$rc\""]) expect(parsed.output).not.toContain(leaked);
+	assert.deepEqual(parsed, { started: true, output: "real output\nsecond line", exitCode: 7 });
+	for (const leaked of ["( set +e", "); rc=$?", "__PI_BG_DONE_", "printf '\\n", "exit \"$rc\""]) assert.ok(!parsed.output.includes(leaked));
 });
 
 test("output is hidden until the exact start marker exists", () => {
 	const parsed = parseTaskOutput("prompt\nwrapper echo\n__PI_BG_nope_DONE__:0", "token");
-	expect(parsed.started).toBeFalse();
-	expect(parsed.output).toBe("");
+	assert.equal(parsed.started, false);
+	assert.equal(parsed.output, "");
 });
 
 test("empty DONE code marks a terminal state without an exit code", () => {
 	const pair = markers("token");
 	const parsed = parseTaskOutput(`${pair.start}\nready\n^C\n${pair.done}:`, "token");
-	expect(parsed).toEqual({ started: true, output: "ready\n^C", exitCode: undefined });
+	assert.deepEqual(parsed, { started: true, output: "ready\n^C", exitCode: undefined });
 });
 
 test("runtime payload and opaque-id bounds reject oversized values", () => {
-	expect(() => assertExecParams({ command: " " })).toThrow("command must not be empty");
-	expect(() => assertExecParams({ command: "x".repeat(64 * 1024 + 1) })).toThrow("UTF-8 bytes");
-	expect(() => assertWriteParams({ task_id: "bt_1", input: "x".repeat(64 * 1024 + 1) })).toThrow("UTF-8 bytes");
-	expect(() => assertTaskId("x".repeat(129))).toThrow("task_id");
+	assert.throws(() => assertExecParams({ command: " " }), /command must not be empty/);
+	assert.throws(() => assertExecParams({ command: "x".repeat(64 * 1024 + 1) }), /UTF-8 bytes/);
+	assert.throws(() => assertWriteParams({ task_id: "bt_1", input: "x".repeat(64 * 1024 + 1) }), /UTF-8 bytes/);
+	assert.throws(() => assertTaskId("x".repeat(129)), /task_id/);
 });
 
 test("task ids are opaque and labels are display-only", () => {
 	const ids = new Set(Array.from({ length: 20 }, () => taskId()));
-	expect(ids.size).toBe(20);
-	expect(taskLabel("dev server")).toBe("dev server");
-	expect(() => taskLabel("line\nbreak")).toThrow("line breaks");
+	assert.equal(ids.size, 20);
+	assert.equal(taskLabel("dev server"), "dev server");
+	assert.throws(() => taskLabel("line\nbreak"), /line breaks/);
 });
 
 test("state paths keep canonical output outside tasks.json", async () => {
@@ -98,15 +99,15 @@ test("state paths keep canonical output outside tasks.json", async () => {
 	try {
 		await ensureStateDirectory(home);
 		const directory = projectDirectory("/tmp/project", home);
-		expect(projectStatePath("/tmp/project", home)).toBe(join(directory, "tasks.json"));
-		expect(taskOutputPath("/tmp/project", "bt_1", home)).toStartWith(join(directory, "outputs"));
-		expect(taskOutputPath("/tmp/project", "bt_1", home)).toEndWith(".txt");
+		assert.equal(projectStatePath("/tmp/project", home), join(directory, "tasks.json"));
+		assert.ok(taskOutputPath("/tmp/project", "bt_1", home).startsWith(join(directory, "outputs")));
+		assert.ok(taskOutputPath("/tmp/project", "bt_1", home).endsWith(".txt"));
 		const state: ProjectState = { version: STATE_VERSION, project_root: "/tmp/project", tasks: { bt_1: task("bt_1") } };
 		await saveProjectState(state, home);
 		await saveTaskOutput("/tmp/project", "bt_1", "final output", home);
-		expect((await loadProjectState("/tmp/project", home)).tasks.bt_1?.status).toBe("terminated");
-		expect(await loadTaskOutput("/tmp/project", "bt_1", home)).toBe("final output");
-		expect((await readFile(projectStatePath("/tmp/project", home), "utf8")).includes("final output")).toBeFalse();
+		assert.equal((await loadProjectState("/tmp/project", home)).tasks.bt_1?.status, "terminated");
+		assert.equal(await loadTaskOutput("/tmp/project", "bt_1", home), "final output");
+		assert.ok(!(await readFile(projectStatePath("/tmp/project", home), "utf8")).includes("final output"));
 	} finally {
 		await rm(join(home, ".pi"), { recursive: true, force: true });
 	}
@@ -122,7 +123,7 @@ test("invalid task records are rejected without echoing their data", async () =>
 			project_root: projectRoot,
 			tasks: { bad: { task_id: "bad", command: "secret-command" } },
 		}));
-		await expect(loadProjectState(projectRoot, home)).rejects.toThrow(`Invalid background-terminal state for ${projectRoot}`);
+		await assert.rejects(loadProjectState(projectRoot, home), new RegExp(`Invalid background-terminal state for ${projectRoot}`));
 	} finally {
 		await rm(join(home, ".pi"), { recursive: true, force: true });
 	}
@@ -134,7 +135,7 @@ test("relative task cwd is resolved from the extension context cwd", async () =>
 	const server = join(project, "server");
 	try {
 		await mkdir(server, { recursive: true });
-		expect(await canonicalProjectRoot("server", project)).toBe(await canonicalProjectRoot(server));
+		assert.equal(await canonicalProjectRoot("server", project), await canonicalProjectRoot(server));
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -147,7 +148,7 @@ test("project lock serializes concurrent state changes", async () => {
 			state.tasks[`id-${index}`] = { ...task(`id-${index}`), status: "running" };
 			return { state, value: index };
 		}, home)));
-		expect(Object.keys((await loadProjectState("/tmp/project", home)).tasks)).toHaveLength(5);
+		assert.equal(Object.keys((await loadProjectState("/tmp/project", home)).tasks).length, 5);
 	} finally {
 		await rm(join(home, ".pi"), { recursive: true, force: true });
 	}
@@ -177,16 +178,16 @@ test("active reads surface Herdr transport failures while terminal reads remain 
 		await saveTaskOutput(projectRoot, "terminal", "local output", home);
 		const service = new BackgroundTerminalService(new HerdrClient(join(home, "missing.sock"), 20), home);
 		const terminal = await service.read({ task_id: "terminal" }, context);
-		expect(terminal).toBe("local output");
-		expect((await service.list({ task_id: "terminal" }, context)).tasks.map((item) => item.task_id)).toEqual(["terminal"]);
-		expect((await service.list({ task_id: "missing" }, context)).tasks).toEqual([]);
+		assert.equal(terminal, "local output");
+		assert.deepEqual((await service.list({ task_id: "terminal" }, context)).tasks.map((item) => item.task_id), ["terminal"]);
+		assert.deepEqual((await service.list({ task_id: "missing" }, context)).tasks, []);
 		let readError: unknown;
 		try {
 			await service.read({ task_id: "active", wait_ms: 0 }, context);
 		} catch (error) {
 			readError = error;
 		}
-		expect(readError instanceof HerdrRequestError && readError.retryable).toBeTrue();
+		assert.ok(readError instanceof HerdrRequestError && readError.retryable);
 	} finally {
 		await rm(join(home, ".pi"), { recursive: true, force: true });
 	}
@@ -203,19 +204,21 @@ test("extension registers exactly the five public background tools", async () =>
 		registerCommand: () => undefined,
 		on: () => undefined,
 	} as never);
-	expect(tools.map((tool) => tool.name)).toEqual(["background_exec", "background_list", "background_read", "background_write", "background_stop"]);
-	expect(tools.find((tool) => tool.name === "background_exec")?.parameters.properties).not.toHaveProperty("wait_ms");
-	expect(tools.find((tool) => tool.name === "background_exec")?.parameters.properties).not.toHaveProperty("output_lines");
-	expect(tools.find((tool) => tool.name === "background_list")?.parameters.properties).toHaveProperty("task_id");
-	expect(tools.find((tool) => tool.name === "background_read")?.parameters.properties).not.toHaveProperty("input");
-	expect(tools.find((tool) => tool.name === "background_read")?.parameters.properties).not.toHaveProperty("cursor");
+	assert.deepEqual(tools.map((tool) => tool.name), ["background_exec", "background_list", "background_read", "background_write", "background_stop"]);
+	const execParams = tools.find((tool) => tool.name === "background_exec")?.parameters.properties;
+	assert.ok(execParams && !("wait_ms" in execParams));
+	assert.ok(execParams && !("output_lines" in execParams));
+	const listParams = tools.find((tool) => tool.name === "background_list")?.parameters.properties;
+	assert.ok(listParams && "task_id" in listParams);
+	const readParams = tools.find((tool) => tool.name === "background_read")?.parameters.properties;
+	assert.ok(readParams && !("input" in readParams) && !("cursor" in readParams));
 
 	const originalRead = BackgroundTerminalService.prototype.read;
 	BackgroundTerminalService.prototype.read = async () => "console only";
 	try {
 		const execute = tools.find((tool) => tool.name === "background_read")?.execute;
-		expect(execute).toBeDefined();
-		expect(await execute?.("call", { task_id: "bt_1" }, undefined, undefined, {})).toEqual({
+		assert.notEqual(execute, undefined);
+		assert.deepEqual(await execute?.("call", { task_id: "bt_1" }, undefined, undefined, {}), {
 			content: [{ type: "text", text: "console only" }],
 			details: undefined,
 		});

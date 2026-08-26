@@ -23,7 +23,7 @@ pi install npm:pi-herdr-background-terminal
 
 - Pi coding agent.
 - A running Herdr daemon with its Unix socket available.
-- Bun for the test commands below.
+- Node.js 22.7+ for the test commands below.
 
 The extension uses `HERDR_SOCKET_PATH` when set; otherwise it defaults to:
 
@@ -70,13 +70,13 @@ See [`docs/OPTIMIZATION.md`](docs/OPTIMIZATION.md) for the complete tool protoco
 Run the focused unit tests:
 
 ```bash
-bun test index.test.ts
+node --test --experimental-transform-types index.test.ts
 ```
 
 Run the Herdr-backed service integration suite:
 
 ```bash
-bun service.integration.ts
+node --experimental-transform-types service.integration.ts
 ```
 
 The integration suite starts a local Unix-socket mock server and does not require a live Herdr daemon.

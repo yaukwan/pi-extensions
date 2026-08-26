@@ -155,8 +155,8 @@ __PI_BG_<token>_DONE__:<exit-code>
 ## 5. 验证
 
 ```bash
-bun test index.test.ts
-bun service.integration.ts
+node --test --experimental-transform-types index.test.ts
+node --experimental-transform-types service.integration.ts
 ```
 
 测试覆盖五工具注册、运行时输入边界、双 marker 输出裁剪、逐任务状态校验、相对 cwd、项目锁、快速非零退出、终态 pane/tab 自动释放、交互输入、中断、终止、terminate 与迟到 watcher 的跨服务竞态、starting 恢复、终态资源补偿回收、终态离线 list/read、终态 write 拒绝和 cleanup 与并发状态更新。

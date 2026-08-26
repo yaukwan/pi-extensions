@@ -6,6 +6,6 @@
   "license": "MIT",
   "packageManager": "pnpm@11.17.0",
   "scripts": {
-    "test": "bun test packages/pi-herdr-background-terminal && bun test packages/pi-herdr-subagent"
+    "test": "node --test --experimental-transform-types \"packages/*/index.test.ts\""
   }
 }

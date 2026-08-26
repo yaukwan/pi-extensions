@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { test } from "node:test";
+import assert from "node:assert/strict";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,16 +14,16 @@ test("builds a quoted child pi command with role tools", () => {
 		model: "anthropic/claude-sonnet",
 		thinking: "high",
 	});
-	expect(command).toContain("--no-extensions");
-	expect(command).toContain(`'${ROLE_TOOLS.scout.join(",")}'`);
-	expect(command).toContain("'anthropic/claude-sonnet'");
-	expect(command).toContain("O'\\''Reilly");
-	expect(command).toContain("--thinking");
+	assert.ok(command.includes("--no-extensions"));
+	assert.ok(command.includes(`'${ROLE_TOOLS.scout.join(",")}'`));
+	assert.ok(command.includes("'anthropic/claude-sonnet'"));
+	assert.ok(command.includes("O'\\''Reilly"));
+	assert.ok(command.includes("--thinking"));
 });
 
 test("recognizes only the subagent label namespace", () => {
-	expect(isSubagentLabel("subagent:scout:task")).toBeTrue();
-	expect(isSubagentLabel("dev-server")).toBeFalse();
+	assert.equal(isSubagentLabel("subagent:scout:task"), true);
+	assert.equal(isSubagentLabel("dev-server"), false);
 });
 
 test("inherits the parent model when no preset is selected", async () => {
@@ -34,7 +35,7 @@ test("inherits the parent model when no preset is selected", async () => {
 		isProjectTrusted: () => true,
 		sessionManager: { getSessionId: () => "session-1", getSessionFile: () => undefined },
 	} as never;
-	expect(await resolveSubagentModel({ prompt: "task", thinking: "low" }, ctx)).toEqual({ model: "parent-provider/parent-model", thinking: "low" });
+	assert.deepEqual(await resolveSubagentModel({ prompt: "task", thinking: "low" }, ctx), { model: "parent-provider/parent-model", thinking: "low" });
 });
 
 test("loads global and project presets and lets explicit thinking win", async () => {
@@ -59,8 +60,8 @@ test("loads global and project presets and lets explicit thinking win", async ()
 			isProjectTrusted: () => true,
 			sessionManager: { getSessionId: () => "session-1", getSessionFile: () => undefined },
 		} as never;
-		expect(await resolveSubagentModel({ prompt: "task", model_preset: "fast", thinking: "max" }, ctx)).toEqual({ model: "provider/project-fast", thinking: "max" });
-		expect(await resolveSubagentModel({ prompt: "task", model_preset: "balanced" }, ctx)).toEqual({ model: "provider/balanced", thinking: "medium" });
+		assert.deepEqual(await resolveSubagentModel({ prompt: "task", model_preset: "fast", thinking: "max" }, ctx), { model: "provider/project-fast", thinking: "max" });
+		assert.deepEqual(await resolveSubagentModel({ prompt: "task", model_preset: "balanced" }, ctx), { model: "provider/balanced", thinking: "medium" });
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -70,7 +71,7 @@ test("loads global and project presets and lets explicit thinking win", async ()
 
 test("rejects a configured model that is absent from the catalog", () => {
 	const ctx = { modelRegistry: { find: () => undefined } } as never;
-	expect(() => resolveConfiguredModel("provider/missing", ctx, "preset")).toThrow("unknown model provider/missing");
+	assert.throws(() => resolveConfiguredModel("provider/missing", ctx, "preset"), /unknown model provider\/missing/);
 });
 
 test("lists only subagents registered by the current session", async () => {
@@ -99,8 +100,8 @@ test("lists only subagents registered by the current session", async () => {
 	}) as never;
 	try {
 		await run("call", { prompt: "task" }, undefined, undefined, context("session-1"));
-		expect((await list("call", {}, undefined, undefined, context("session-1")) as { details: { tasks: unknown[] } }).details.tasks).toHaveLength(1);
-		expect((await list("call", {}, undefined, undefined, context("session-2")) as { details: { tasks: unknown[] } }).details.tasks).toHaveLength(0);
+		assert.equal((await list("call", {}, undefined, undefined, context("session-1")) as { details: { tasks: unknown[] } }).details.tasks.length, 1);
+		assert.equal((await list("call", {}, undefined, undefined, context("session-2")) as { details: { tasks: unknown[] } }).details.tasks.length, 0);
 	} finally {
 		backgroundTerminalService.exec = originalExec;
 		backgroundTerminalService.list = originalList;
@@ -137,8 +138,8 @@ test("marks bounded subagent output as truncated", async () => {
 	try {
 		await run("call", { prompt: "task" }, undefined, undefined, context);
 		const result = await read("call", { subagent_id: "bt_read_1" }, undefined, undefined, context) as { content: Array<{ text: string }>; details: { output_truncated: boolean } };
-		expect(result.details.output_truncated).toBeTrue();
-		expect(result.content[0]?.text).toContain("output truncated");
+		assert.equal(result.details.output_truncated, true);
+		assert.ok(result.content[0]?.text.includes("output truncated"));
 	} finally {
 		backgroundTerminalService.exec = originalExec;
 		backgroundTerminalService.list = originalList;
@@ -188,10 +189,10 @@ test("waits for any subagent and returns every requested task", async () => {
 		await run("call", { prompt: "first" }, undefined, undefined, context);
 		await run("call", { prompt: "second" }, undefined, undefined, context);
 		const result = await wait("call", { subagent_ids: ["bt_wait_1", "bt_wait_2"], mode: "any", wait_ms: 1000 }, undefined, undefined, context) as { content: Array<{ text: string }>; details: { timed_out: boolean; tasks: unknown[] } };
-		expect(result.details.timed_out).toBeFalse();
-		expect(result.details.tasks).toHaveLength(2);
-		expect(result.content[0]?.text).toContain("bt_wait_1 [exited]");
-		expect(result.content[0]?.text).toContain("bt_wait_2 [running]");
+		assert.equal(result.details.timed_out, false);
+		assert.equal(result.details.tasks.length, 2);
+		assert.ok(result.content[0]?.text.includes("bt_wait_1 [exited]"));
+		assert.ok(result.content[0]?.text.includes("bt_wait_2 [running]"));
 	} finally {
 		backgroundTerminalService.exec = originalExec;
 		backgroundTerminalService.list = originalList;
@@ -206,13 +207,14 @@ test("registers the five asynchronous lifecycle tools", () => {
 		registerCommand: () => undefined,
 		on: () => undefined,
 	} as never);
-	expect(tools.map((tool) => tool.name)).toEqual([
+	assert.deepEqual(tools.map((tool) => tool.name), [
 		"subagent_run",
 		"subagent_list",
 		"subagent_read",
 		"subagent_wait",
 		"subagent_stop",
 	]);
-	expect(tools.find((tool) => tool.name === "subagent_run")?.parameters?.properties).toHaveProperty("model_preset");
-	expect(tools.find((tool) => tool.name === "subagent_run")?.parameters?.properties).not.toHaveProperty("model");
+	const runParams = tools.find((tool) => tool.name === "subagent_run")?.parameters?.properties;
+	assert.ok(runParams && "model_preset" in runParams);
+	assert.ok(runParams && !("model" in runParams));
 });
