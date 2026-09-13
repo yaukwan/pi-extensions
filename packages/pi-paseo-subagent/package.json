@@ -1,0 +1,32 @@
+{
+  "name": "pi-paseo-subagent",
+  "version": "0.1.0",
+  "description": "A Pi extension for Paseo-tracked delegated subagents.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yaukwan/pi-extensions.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "paseo",
+    "subagent"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "docs"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
