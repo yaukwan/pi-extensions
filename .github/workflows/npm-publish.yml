@@ -5,6 +5,7 @@ on:
     tags:
       - "pi-herdr-background-terminal-v*"
       - "pi-herdr-subagent-v*"
+      - "pi-paseo-subagent-v*"
 
 jobs:
   publish-background-terminal:
@@ -41,3 +42,20 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter pi-herdr-subagent publish --no-git-checks
+
+  publish-paseo-subagent:
+    if: startsWith(github.ref, 'refs/tags/pi-paseo-subagent-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter pi-paseo-subagent publish --no-git-checks
