@@ -359,6 +359,9 @@ test("splits provider/model ids and rejects empty models", () => {
 	assert.deepEqual(splitProviderModel("pi"), { provider: "pi" });
 	assert.deepEqual(splitProviderModel("pi/nikoapi/gpt-5.6-sol"), { provider: "pi", model: "nikoapi/gpt-5.6-sol" });
 	assert.throws(() => splitProviderModel("pi/"), /invalid_arguments/);
+	assert.throws(() => splitProviderModel("/h/deepseek-flash"), /invalid_arguments: provider "\/h\/deepseek-flash" has an empty provider/);
+	assert.throws(() => splitProviderModel("/"), /invalid_arguments/);
+	assert.throws(() => splitProviderModel("   "), /invalid_arguments: provider must not be empty/);
 	assert.equal(providerSelector("pi", "h/deepseek-flash"), "pi/h/deepseek-flash");
 });
 
@@ -538,6 +541,26 @@ test("reads a child's activity and refuses agents it does not own", async () => 
 	});
 });
 
+test("does not resume an archived child when reading it", async () => {
+	const ARCHIVED_AT = "2026-09-13T04:13:12.000Z";
+	const daemon = makeDaemon({
+		respond: (call) => (call.name === "get_agent_status" && call.args.agentId === CHILD_ID
+			? ok({ status: "closed", snapshot: childSnapshot({ status: "closed", archivedAt: ARCHIVED_AT }) })
+			: undefined),
+	});
+	await withFakeDaemon(daemon, async () => {
+		const result = await tool(registeredTools(), "subagent_read")("call", { subagent_id: CHILD_ID }, undefined, undefined, fakeContext()) as {
+			content: Array<{ text: string }>;
+			details: { summary: { archived?: boolean } };
+		};
+		// `get_agent_activity` would resume the agent on the daemon and clear its `archivedAt`.
+		assert.deepEqual(daemon.calls.map((call) => call.name), ["get_agent_status"]);
+		assert.equal(result.details.summary.archived, true);
+		assert.match(result.content[0]?.text ?? "", new RegExp(`${CHILD_ID} \\[closed\\] scout auth-review attention=finished archived`));
+		assert.match(result.content[0]?.text ?? "", /archived: this subagent was removed from the track/);
+	});
+});
+
 test("refuses a non-owned agent even though it exists", async () => {
 	const daemon = makeDaemon();
 	daemon.respond = (call) => {
@@ -563,6 +586,21 @@ test("waits for every child and reports their transcripts", async () => {
 		assert.match(result.content[0]?.text ?? "", /still running after 200ms/);
 		assert.match(result.content[0]?.text ?? "", /two real bugs found/);
 		assert.equal(daemon.calls.filter((call) => call.name === "list_agents").length > 1, true);
+	});
+});
+
+test("reads no transcript for an archived child during a wait", async () => {
+	const daemon = makeDaemon();
+	daemon.state.children = [
+		childRow({ status: "closed", archivedAt: "2026-09-13T04:13:12.000Z" }),
+		childRow({ id: OTHER_CHILD_ID, title: "worker: parser", status: "running", requiresAttention: false, attentionReason: null }),
+	];
+	await withFakeDaemon(daemon, async () => {
+		const result = await tool(registeredTools(), "subagent_wait")("call", { subagent_ids: [CHILD_ID, OTHER_CHILD_ID], wait_ms: 200 }, undefined, undefined, fakeContext()) as { content: Array<{ text: string }> };
+		// The archived child is skipped, so `get_agent_activity` only reaches the running one.
+		assert.deepEqual(daemon.calls.filter((call) => call.name === "get_agent_activity").map((call) => call.args.agentId), [OTHER_CHILD_ID]);
+		assert.match(result.content[0]?.text ?? "", /archived: this subagent was removed from the track/);
+		assert.match(result.content[0]?.text ?? "", /two real bugs found/);
 	});
 });
 

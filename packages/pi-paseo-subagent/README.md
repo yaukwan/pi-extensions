@@ -28,7 +28,7 @@ Requirements:
 | --- | --- |
 | `subagent_run` | Create a Paseo agent as a subagent of this session and return its id. |
 | `subagent_list` | List this session's subagents with state and attention flags. |
-| `subagent_read` | Read a subagent's activity, optionally waiting for it to settle. |
+| `subagent_read` | Read a subagent's activity, optionally waiting for it to settle. Archived subagents return a status line instead (see Lifecycle). |
 | `subagent_wait` | Wait for one or more subagents (`all` or `any`) with a shared deadline. |
 | `subagent_stop` | Interrupt a subagent, or terminate it by archiving it out of the track. |
 | `subagent_presets` | List the Paseo agent profiles available as presets, including their notes. |
@@ -73,6 +73,8 @@ Children are created with Paseo's finish notification enabled, so the parent is 
 `subagent_stop mode: "interrupt"` calls Paseo's cancel: the agent stops its current run and stays available for another prompt. `subagent_stop mode: "terminate"` archives it: interrupted if running, removed from the parent's Subagents track, and still recoverable in Paseo as `status: "closed"` (visible here through `subagent_list {include_finished: true}`). Nothing in this package hard-deletes an agent — that stays a human action in Paseo.
 
 Paseo archives a subagent together with its parent when the parent is archived, so long-lived subagents should not be attached to a short-lived parent.
+
+An archived subagent's transcript is not returned by `subagent_read` or `subagent_wait`: Paseo's `get_agent_activity` resumes an archived agent, which clears its archive flag (it reappears in the default `subagent_list`) and fires its finish notification a second time. Those tools answer with the status line and an `archived:` note instead, so archived children stay archived — read their transcript in Paseo.
 
 ## Difference from `pi-herdr-subagent`
 

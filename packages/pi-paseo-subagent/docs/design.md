@@ -57,7 +57,7 @@ Field mapping onto `create_agent`, which has no profile parameter (documented in
 2. `profile` argument (profile name or id) — resolved through `list_profiles`.
 3. Neither — inherit the calling agent's own `provider`, `model`, and `effectiveThinkingOptionId` from `get_agent_status`.
 
-An explicit `thinking` argument overrides whatever the profile or the parent supplied. Paseo thinking ids are provider-specific, so the profile's and the parent's ids are forwarded as-is while an explicit override is passed through unchanged. `provider` and `profile` together are rejected as ambiguous.
+An explicit `thinking` argument overrides whatever the profile or the parent supplied. Paseo thinking ids are provider-specific, so the profile's and the parent's ids are forwarded as-is while an explicit override is passed through unchanged. `provider` and `profile` together are rejected as ambiguous. `provider` must be `provider` or `provider/model` with both parts non-empty: `/model`, `pi/`, and a blank value fail locally as `invalid_arguments` instead of reaching the daemon, which answers with an opaque `MCP error -32602` for the same input.
 
 Paseo profiles replaced this package's earlier `pi-paseo-subagent.presets` setting, which duplicated configuration the user already curates in Paseo (and required nesting Pi provider ids inside Paseo provider ids). There is no package-level preset configuration any more.
 
@@ -68,7 +68,7 @@ Rules the implementation follows:
 1. **Ownership first.** Every read, wait, stop, and future permit call resolves the target with `get_agent_status` and requires the parent label. A non-owned or unknown id fails with `subagent_not_found` before any lifecycle call.
 2. **Two labels per child.** `paseo.parent-agent-id` (daemon-stamped, ownership) and `pi-paseo-subagent=<pi session id>` (ours, so rows are identifiable in the Paseo UI and through `paseo ls --label`).
 3. **Push by default, wait opt-in.** Children are created with `notifyOnFinish: true`, so the parent is woken with the result instead of polling. `subagent_wait` remains for "I need the answer now", implemented as in-process polling of `list_agents` at 500 ms with one shared deadline.
-4. **No `kill_agent`.** `interrupt` = `cancel_agent` (the agent survives and can be prompted again), `terminate` = `archive_agent` (soft delete, recoverable, and still visible through `list_agents {includeArchived: true}` as `status: "closed"`). Hard deletion stays a human action in Paseo.
+4. **No `kill_agent`.** `interrupt` = `cancel_agent` (the agent survives and can be prompted again), `terminate` = `archive_agent` (soft delete, recoverable, and still visible through `list_agents {includeArchived: true}` as `status: "closed"`). Hard deletion stays a human action in Paseo. **An archived child is never read through `get_agent_activity`**: the daemon resumes an archived agent when its activity is requested, which clears `archivedAt` (a ghost row in the default list) and re-fires the finish notification; `get_agent_activity` has no no-wake variant, so the read is short-circuited to a status line plus an `archived:` note and the transcript stays a Paseo concern.
 5. **Roles stay honest.** `scout` / `reviewer` / `worker` shape the child's prompt and title. Where a provider exposes modes, `settings.modeId` can become real enforcement; for the `pi` provider (`modes: []`, `AvailableModes: []`) the role is prompt-level only, and the tool descriptions say so.
 6. **Stateless.** Nothing is remembered between calls: discovery is derived from the daemon's own labels, so children stay visible after an extension reload or session resume.
 
@@ -78,8 +78,8 @@ Rules the implementation follows:
 | --- | --- | --- |
 | `subagent_run` | `get_agent_status` (inherit), `list_profiles` (profile), `list_agents` (cap), `create_agent` | `prompt`, `role`, `name`, `profile`, `provider`, `thinking`. Returns the child id; the daemon's `guidance` string is passed through in `details`. |
 | `subagent_list` | `list_agents` | Filters by parent label, shows role, status, `attention=...`, `archived`; `include_finished` maps to `includeArchived`. |
-| `subagent_read` | `get_agent_status`, `get_agent_activity` (+ `list_agents` when waiting) | Returns the daemon's curated activity plus a status line; `wait_ms` first waits for the child to settle. |
-| `subagent_wait` | `list_agents`, `get_agent_activity` | `all` / `any`, one shared deadline; a child blocked on permission settles immediately with a note; nothing is cancelled by a timeout. |
+| `subagent_read` | `get_agent_status`, `get_agent_activity` (+ `list_agents` when waiting) | Returns the daemon's curated activity plus a status line; `wait_ms` first waits for the child to settle. An archived child returns the status line and the `archived:` note without calling `get_agent_activity`. |
+| `subagent_wait` | `list_agents`, `get_agent_activity` | `all` / `any`, one shared deadline; a child blocked on permission settles immediately with a note; nothing is cancelled by a timeout. Archived children are reported without a transcript read. |
 | `subagent_stop` | `cancel_agent` / `archive_agent` | `interrupt` / `terminate`. |
 | `subagent_presets` | `list_profiles` | Read-only: names, ids, provider/model, thinking, notes. |
 
@@ -97,15 +97,15 @@ Discovery is `list_agents` filtered by parent label, and `list_agents` is scoped
 
 ## Verification
 
-Unit tests (`pnpm test`, 50 tests across the monorepo, 29 for this package) cover endpoint resolution, host parsing, SSE and plain-JSON parsing, credential headers, the whole error vocabulary, profile and child parsing, wait notes, target resolution (inherit / profile / explicit / ambiguous), the active-child cap, trust and missing-context refusals, ownership refusals (non-existent and non-owned ids), listing and archived listing, read, `wait` in `all` and `any` modes, stop mapping, and profile listing. They run against a fake `fetch`, so CI needs no daemon.
+Unit tests (`pnpm test`, 52 tests across the monorepo, 31 for this package) cover endpoint resolution, host parsing, SSE and plain-JSON parsing, credential headers, the whole error vocabulary, profile and child parsing, wait notes, target resolution (inherit / profile / explicit / ambiguous), the active-child cap, trust and missing-context refusals, ownership refusals (non-existent and non-owned ids), provider id validation, listing and archived listing, read, `wait` in `all` and `any` modes, the archived-read short-circuit, stop mapping, and profile listing. They run against a fake `fetch`, so CI needs no daemon.
 
-`tsc --noEmit --strict` passes for `index.ts`, `mcp-client.ts`, and `index.test.ts` (TypeScript 5.0.2; this repo has no typecheck script, so the flags are `--module nodenext --moduleResolution nodenext --allowImportingTsExtensions --target es2022`).
+`tsc --noEmit --strict` passes for `index.ts`, `mcp-client.ts`, and `index.test.ts` (TypeScript 5.0.2; this repo has no typecheck script, so the flags are `--skipLibCheck --module nodenext --moduleResolution nodenext --allowImportingTsExtensions --target es2022`; without `--skipLibCheck` the pinned `@types/node` 26 is too new for TypeScript 5.0.2 and fails inside `node_modules`, on untouched files too).
 
 Live end-to-end against the running daemon:
 
 - `subagent_run` created a child on `pi/h/deepseek-flash` with `thinking=minimal`; the daemon stamped `paseo.parent-agent-id` and reported `guidance`.
 - `subagent_list` found exactly the children of this session, including `attention=finished`.
-- `subagent_wait` and `subagent_read` returned the curated activity (`pong`) — also for an archived child (`[closed] ... archived`).
+- `subagent_wait` and `subagent_read` returned the curated activity (`pong`). Reading that child after `terminate` resumed it on the daemon (log: `Agent resumed from persistence`) and cleared its `archivedAt`, so it reappeared in the default list; the same read of a `get_agent_activity` call sent straight to the daemon was used as a control and reproduced exactly that. Through the package the read now answers with the `archived:` note and the child stays `closed` with its `archivedAt` intact.
 - **Push worked**: the notification for the finished child arrived in this session as a `<paseo-system>` prompt carrying the child's last message.
 - `subagent_stop mode: "terminate"` archived the child (`success: true`), after which the default list was empty and `include_finished` showed `[closed] ... archived`.
 - `subagent_read` on the parent's own id was refused with `subagent_not_found: ... is not a subagent of this session`.

@@ -20,6 +20,8 @@ const SESSION_LABEL_KEY = "pi-paseo-subagent";
 const PARENT_AGENT_ID_LABEL = "paseo.parent-agent-id";
 const ACTIVE_STATUSES = ["initializing", "running"];
 const ROLES = ["scout", "reviewer", "worker"] as const;
+const ARCHIVED_TRANSCRIPT_NOTE =
+	"archived: this subagent was removed from the track, and reading it here would resume it on the daemon (re-adding it to the list and re-firing its finish notification). Inspect it in Paseo instead.";
 
 export type SubagentRole = typeof ROLES[number];
 /** Overridable so tests do not have to wait out a real poll interval. */
@@ -139,10 +141,13 @@ export function parseSubagentTitle(title: string): { role?: SubagentRole; name: 
 /** Accepts `provider` or `provider/model`. */
 export function splitProviderModel(value: string): { provider: string; model?: string } {
 	const separator = value.indexOf("/");
-	if (separator <= 0) return { provider: value.trim() };
+	if (separator === 0) fail("invalid_arguments", `provider "${value}" has an empty provider`);
+	const provider = value.slice(0, separator < 0 ? undefined : separator).trim();
+	if (!provider) fail("invalid_arguments", "provider must not be empty");
+	if (separator < 0) return { provider };
 	const model = value.slice(separator + 1).trim();
 	if (!model) fail("invalid_arguments", `provider "${value}" has an empty model`);
-	return { provider: value.slice(0, separator).trim(), model };
+	return { provider, model };
 }
 
 export function providerSelector(provider: string, model?: string): string {
@@ -355,8 +360,11 @@ async function pollChildren(ids: string[], mode: "all" | "any", waitMs: number, 
 	}
 }
 
-async function readActivity(agentId: string, outputLines: number, parentId: string, signal?: AbortSignal): Promise<string> {
-	return parseActivity(await paseoMcp.callTool<unknown>("get_agent_activity", { agentId, limit: outputLines }, { callerAgentId: parentId, signal }));
+async function readActivity(child: { subagent_id: string; archived?: boolean }, outputLines: number, parentId: string, signal?: AbortSignal): Promise<string> {
+	// `get_agent_activity` resumes an archived agent on the daemon, which clears `archivedAt` (ghost row in the
+	// default list) and re-fires its finish notification. There is no no-wake variant of the tool.
+	if (child.archived) return ARCHIVED_TRANSCRIPT_NOTE;
+	return parseActivity(await paseoMcp.callTool<unknown>("get_agent_activity", { agentId: child.subagent_id, limit: outputLines }, { callerAgentId: parentId, signal }));
 }
 
 function roleInstructions(role: SubagentRole): string {
@@ -480,8 +488,8 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 				child = outcome.children.get(snapshot.id);
 				timedOut = outcome.timedOut;
 			}
-			const activity = await readActivity(snapshot.id, params.output_lines ?? DEFAULT_OUTPUT_LINES, parentId, signal);
 			const summary = child ?? summarizeSnapshot(snapshot);
+			const activity = await readActivity(summary, params.output_lines ?? DEFAULT_OUTPUT_LINES, parentId, signal);
 			return {
 				content: [{ type: "text", text: `${summaryText(summary)}${waitNote(child, waitMs, timedOut)}\n\n${activity}` }],
 				details: { summary, timed_out: timedOut, output: activity },
@@ -526,10 +534,10 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 				timedOut = outcome.timedOut;
 			}
 			const outputLines = params.output_lines ?? DEFAULT_OUTPUT_LINES;
-			const results = await Promise.all(ids.map(async (id) => ({
-				child: byId.get(id) ?? summarizeSnapshot(snapshots.get(id) as AgentSnapshot),
-				activity: await readActivity(id, outputLines, parentId, signal),
-			})));
+			const results = await Promise.all(ids.map(async (id) => {
+				const child = byId.get(id) ?? summarizeSnapshot(snapshots.get(id) as AgentSnapshot);
+				return { child, activity: await readActivity(child, outputLines, parentId, signal) };
+			}));
 			const text = results.map(({ child, activity }) => `${summaryText(child)}${waitNote(child, waitMs, timedOut)}\n\n${activity}`).join("\n\n---\n\n");
 			return {
 				content: [{ type: "text", text }],
@@ -609,7 +617,7 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 				}
 				if (id && (action === "read" || action === "interrupt" || action === "terminate")) {
 					const snapshot = await requireOwnedChild(id, parentId);
-					if (action === "read") ctx.ui.notify(await readActivity(id, DEFAULT_OUTPUT_LINES, parentId), "info");
+					if (action === "read") ctx.ui.notify(await readActivity({ subagent_id: snapshot.id, archived: snapshot.archived }, DEFAULT_OUTPUT_LINES, parentId), "info");
 					else if (action === "interrupt") await paseoMcp.callTool<unknown>("cancel_agent", { agentId: id }, { callerAgentId: parentId });
 					else await paseoMcp.callTool<unknown>("archive_agent", { agentId: id }, { callerAgentId: parentId });
 					ctx.ui.notify(`${snapshot.id} ${action}`, "info");
