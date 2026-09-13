@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -151,12 +152,13 @@ test("run.sh embeds only paths: command bytes live in cmd.sh, log mode adds env 
 	const paths = { cmdPath: "/s/t-x/cmd.sh", statusPath: "/s/t-x/status", logPath: "/s/t-x/log" };
 	const run = generateRunSh(paths);
 	assert.ok(run.includes("export NO_COLOR=1 TERM=dumb PAGER=cat"));
-	assert.ok(run.includes(`( . ${shellQuote(paths.cmdPath)} ) > ${shellQuote(paths.logPath)} 2>&1`));
+	assert.ok(run.includes(`( . ${shellQuote(paths.cmdPath)} ) <&0 > ${shellQuote(paths.logPath)} 2>&1`), "the command keeps the terminal stdin, not the /dev/null a bare async list gets");
 	assert.ok(run.includes(`status=${shellQuote(paths.statusPath)}`));
 	for (const trap of ["HUP", "INT", "TERM"]) assert.ok(run.includes(trap));
 	const screen = generateRunSh({ cmdPath: paths.cmdPath, statusPath: paths.statusPath });
 	assert.ok(!screen.includes("NO_COLOR"), "screen mode keeps the environment untouched");
 	assert.ok(!screen.includes("2>&1"), "screen mode does not redirect output");
+	assert.ok(screen.includes(`( . ${shellQuote(paths.cmdPath)} ) <&0 &`), "screen mode keeps the terminal stdin too");
 	assert.equal(generateSubmitLine("/s/t-x/run.sh"), "sh '/s/t-x/run.sh'");
 	assert.ok(shellQuote("a'b").includes(`'\\''`));
 });
@@ -592,13 +594,65 @@ test("a signal to the wrapper alone still records the trap exit code immediately
 	const { task_id } = await service.exec({ command: "sleep 30" }, context(projectRoot));
 	const record = await loadTaskRecord(projectRoot, task_id, home);
 	// No PTY and no group kill: only the wrapper process is signaled, the hardest case.
-	const child = spawn("sh", [join(record.dir, "run.sh")], { stdio: "ignore" });
+	// detached mirrors the PTY (the wrapper owns its process group); without it the
+	// wrapper's group kill would take the test runner down.
+	const child = spawn("sh", [join(record.dir, "run.sh")], { detached: true, stdio: "ignore" });
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	const started = Date.now();
 	child.kill("SIGINT");
 	await new Promise((resolve) => child.once("exit", resolve));
 	assert.ok(Date.now() - started < 500, "the trap fires immediately, not when the child times out");
 	assert.equal((await statusExit(record.dir)), 130);
+	await cleanupHome(home);
+});
+
+const processAlive = (pid: number): boolean => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+test("a signal to the wrapper alone kills the command and its descendants, not only the wrapper", async () => {
+	const home = temporaryHome();
+	const projectRoot = await temporaryProject(home);
+	const service = new PaseoBackgroundTerminalService(new FakeTerminals(), home);
+	const pidFile = join(projectRoot, "sleeper.pid");
+	const { task_id } = await service.exec({ command: `sleep 30 & echo $! > ${shellQuote(pidFile)}; wait` }, context(projectRoot));
+	const record = await loadTaskRecord(projectRoot, task_id, home);
+	const child = spawn("sh", [join(record.dir, "run.sh")], { detached: true, stdio: "ignore" });
+	let commandPid = 0;
+	for (let attempt = 0; attempt < 100 && !commandPid; attempt += 1) {
+		commandPid = Number.parseInt(await readFile(pidFile, "utf8").catch(() => ""), 10) || 0;
+		if (!commandPid) await delay(50);
+	}
+	assert.ok(commandPid > 0, "the command never reported its pid");
+	child.kill("SIGINT");
+	const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+		child.once("exit", (code, signal) => resolve({ code, signal }));
+	});
+	assert.equal((await statusExit(record.dir)), 130);
+	// The daemon signals only the wrapper, so the wrapper has to take its group down.
+	assert.deepEqual([exit.code, exit.signal], [130, null], "the wrapper survives its own group signal and exits 130");
+	const deadline = Date.now() + 5_000;
+	while (processAlive(commandPid) && Date.now() < deadline) await delay(50);
+	assert.ok(!processAlive(commandPid), `sleep pid ${commandPid} survived the interrupt`);
+	await cleanupHome(home);
+});
+
+test("a command reading stdin gets the terminal input instead of /dev/null", async () => {
+	const home = temporaryHome();
+	const projectRoot = await temporaryProject(home);
+	const service = new PaseoBackgroundTerminalService(new FakeTerminals(), home);
+	const { task_id } = await service.exec({ command: 'read -r line; echo "got:[$line]"' }, context(projectRoot));
+	const record = await loadTaskRecord(projectRoot, task_id, home);
+	// The daemon hands the wrapper the PTY as stdin; a pipe stands in for it offline.
+	const child = spawn("sh", [join(record.dir, "run.sh")], { stdio: ["pipe", "ignore", "ignore"] });
+	child.stdin?.end("hello\n");
+	await new Promise((resolve) => child.once("exit", resolve));
+	assert.equal((await readFile(logPath(record.dir), "utf8")).trim(), "got:[hello]");
 	await cleanupHome(home);
 });
 

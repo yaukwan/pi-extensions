@@ -114,16 +114,24 @@ export function generateRunSh(paths: { cmdPath: string; statusPath: string; logP
 	// `& wait` is the POSIX trap-safe wait idiom: a trapped signal interrupts the
 	// wait immediately (a plain foreground wait may defer the trap until the
 	// child exits, which costs seconds for a hung command).
-	const redirect = paths.logPath ? `> ${shellQuote(paths.logPath)} 2>&1` : "";
+	// `<&0` restores the terminal stdin, which POSIX assigns /dev/null to an
+	// asynchronous list in a non-interactive shell; without it background_write
+	// can never reach a command that reads (the bytes stay queued for the session shell).
+	// The trap kills its own process group because the daemon signals only the wrapper
+	// process, and `kill "$child"` would orphan the command's descendants. Sibling
+	// signals become no-ops first so the group TERM cannot kill the wrapper before it
+	// records its own code; the children keep the default disposition they forked with.
+	const redirect = paths.logPath ? `<&0 > ${shellQuote(paths.logPath)} 2>&1` : "<&0";
+	const trap = (code: number, self: "HUP" | "INT" | "TERM", siblings: string) =>
+		`trap 'printf %s ${code} > "$status"; trap ":" ${siblings}; kill -TERM 0; exit ${code}' ${self}`;
 	return [
 		"#!/bin/sh",
 		`status=${shellQuote(paths.statusPath)}`,
 		...(paths.logPath ? [LOG_ENV_EXPORTS] : []),
-		'child=""',
-		'trap \'printf %s 129 > "$status"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 129\' HUP',
-		'trap \'printf %s 130 > "$status"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 130\' INT',
-		'trap \'printf %s 143 > "$status"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 143\' TERM',
-		`( . ${shellQuote(paths.cmdPath)} ) ${redirect} &`.trimEnd(),
+		trap(129, "HUP", "INT TERM"),
+		trap(130, "INT", "HUP TERM"),
+		trap(143, "TERM", "HUP INT"),
+		`( . ${shellQuote(paths.cmdPath)} ) ${redirect} &`,
 		'child=$!',
 		'wait "$child"',
 		'printf \'%s\' "$?" > "$status"',

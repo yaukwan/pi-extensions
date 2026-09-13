@@ -64,18 +64,19 @@ Paseo terminal (session)
 #!/bin/sh
 status='/abs/t-x/status'
 export NO_COLOR=1 TERM=dumb PAGER=cat GIT_PAGER=cat GH_PAGER=cat COLORTERM=
-child=''
-trap 'printf %s 129 > "$status"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 129' HUP
-trap 'printf %s 130 > "$status"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 130' INT
-trap 'printf %s 143 > "$status"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 143' TERM
-( . '/abs/t-x/cmd.sh' ) > '/abs/t-x/log' 2>&1 &
+trap 'printf %s 129 > "$status"; trap ":" INT TERM; kill -TERM 0; exit 129' HUP
+trap 'printf %s 130 > "$status"; trap ":" HUP TERM; kill -TERM 0; exit 130' INT
+trap 'printf %s 143 > "$status"; trap ":" HUP INT; kill -TERM 0; exit 143' TERM
+( . '/abs/t-x/cmd.sh' ) <&0 > '/abs/t-x/log' 2>&1 &
 child=$!
 wait "$child"
 printf '%s' "$?" > "$status"
 ```
 
 - `& wait` is the POSIX trap-safe wait idiom: a trapped signal interrupts the wait immediately, so Ctrl-C is recorded in milliseconds instead of deferring the trap until the child exits (verified: wrapper killed with no PTY and no group signal still lands `130` in <500 ms).
-- Screen mode: drop the redirection and the env exports; the command keeps the PTY as stdout/stderr.
+- `<&0` keeps the PTY as the command's stdin. POSIX assigns `/dev/null` to an asynchronous list in a non-interactive shell, and without the explicit dup every `background_write` byte would sit in the PTY input queue until the wrapper exits — then run in the session shell (live-verified injection marker). With `<&0` the foreground process reads what is typed.
+- The traps record the status first, demote their sibling signals to no-ops, then TERM the whole process group: the daemon's `C-c` reaches only the wrapper process, and killing just the direct child orphans grandchildren (live-verified: `sleep` survived with `ppid=1` while the task reported `exited`). The no-op siblings keep the group TERM from killing the wrapper before it records its own code; children keep the default dispositions they forked with. `kill -TERM 0` is safe because the interactive session shell runs `sh run.sh` as its own foreground process group; the `share_shell` variant (sourced into the session shell, no wrapper process) will need `set -m` + `kill -TERM -$child`.
+- Screen mode: drop the redirection and the env exports, keep `<&0`; the command keeps the PTY as stdin/stdout/stderr.
 - `share_shell: true` (P1): submit `. <run.sh>` instead — `cd`/`export` persist in the session (omp-style state carry-over). The sourced-trap-on-interrupt path is designed but not yet live-verified; the default `sh` path is.
 - Status grammar: a decimal exit code (`129`/`130`/`143` for HUP/INT/TERM via trap), `terminated` (a stop where the trap lost the race), or `error` (submit failed).
 - Known race: during the first milliseconds of wrapper startup the traps are not yet installed, so an immediately delivered signal can kill the wrapper with the default action. The service closes this: `background_stop` writes `terminated` when no status appears within its confirmation window — the command is dead either way, and the record never lies about running.
