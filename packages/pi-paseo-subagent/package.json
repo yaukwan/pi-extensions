@@ -16,6 +16,7 @@
   ],
   "files": [
     "index.ts",
+    "mcp-client.ts",
     "README.md",
     "docs"
   ],
