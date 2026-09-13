@@ -9,6 +9,7 @@ Monorepo for Pi extensions built on [Herdr](https://herdr.dev) and [Paseo](https
 | [`pi-herdr-background-terminal`](packages/pi-herdr-background-terminal) | Run shell commands in persistent Herdr terminal panes and expose their lifecycle through `background_*` tools. | `pi install npm:pi-herdr-background-terminal` |
 | [`pi-herdr-subagent`](packages/pi-herdr-subagent) | Run delegated Pi agents in persistent Herdr panes through `pi-herdr-background-terminal` (`subagent_*` tools). | `pi install npm:pi-herdr-subagent` |
 | [`pi-paseo-subagent`](packages/pi-paseo-subagent) | Delegate work to Paseo-managed subagents that appear in Paseo's Subagents track (`subagent_*` tools). | `pi install npm:pi-paseo-subagent` |
+| [`pi-paseo-background-terminal`](packages/pi-paseo-background-terminal) | Run background tasks in persistent Paseo terminal sessions with out-of-band completion and output records (`background_*` tools). | `pi install npm:pi-paseo-background-terminal` |
 
 See each package's README for features, tool reference, and configuration.
 
@@ -28,6 +29,14 @@ cd packages/pi-herdr-background-terminal && node --experimental-transform-types 
 ```
 
 The Paseo-backed extension is covered by unit tests against a stubbed daemon. Verifying it end to end needs a running Paseo daemon and a Pi session inside a Paseo agent; see [its design notes](packages/pi-paseo-subagent/docs/design.md#verification).
+
+The Paseo background-terminal package runs a fake-daemon HTTP integration and a real-daemon probe:
+
+```bash
+cd packages/pi-paseo-background-terminal && node --experimental-transform-types service.integration.ts
+# inside a Pi session running as a Paseo agent:
+node --experimental-transform-types live.probe.ts
+```
 
 ## License
 

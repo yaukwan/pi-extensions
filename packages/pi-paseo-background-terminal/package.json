@@ -1,0 +1,38 @@
+{
+	"name": "pi-paseo-background-terminal",
+	"version": "0.1.0",
+	"description": "A Pi extension for persistent Paseo terminal sessions running background tasks.",
+	"type": "module",
+	"main": "./index.ts",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/yaukwan/pi-extensions.git"
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"paseo",
+		"terminal"
+	],
+	"files": [
+		"index.ts",
+		"mcp-client.ts",
+		"paseo-terminal-client.ts",
+		"runner.ts",
+		"protocol.ts",
+		"README.md",
+		"docs",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	}
+}
