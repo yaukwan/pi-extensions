@@ -155,7 +155,7 @@ async function run(): Promise<void> {
 
 	try {
 		// 1. Log-mode task: exact bytes, real exit code, clean screen.
-		const hello = await service.exec({ command: "echo hello-from-task; exit 7" }, context);
+		const hello = await service.exec({ command: "echo hello-from-task; exit 7", output: "log" }, context);
 		assert.match(hello.summary.state, /running/);
 		await waitUntil(async () => (await service.list({ task_id: hello.task_id }, context)).tasks[0]?.state === "exited", 10_000, "task to exit");
 		const exited = (await service.list({ task_id: hello.task_id }, context)).tasks[0];

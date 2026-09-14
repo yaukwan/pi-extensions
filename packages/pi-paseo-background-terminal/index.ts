@@ -204,7 +204,7 @@ export class PaseoBackgroundTerminalService {
 			label: taskLabel(params.label, params.command),
 			command: params.command,
 			cwd,
-			output: params.output ?? "log",
+			output: params.output ?? "screen",
 			created_at: new Date().toISOString(),
 			read_offset: 0,
 		};
@@ -396,7 +396,7 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 		promptSnippet: "Start a command in a persistent Paseo background terminal session",
 		promptGuidelines: [
 			"background_exec returns a task_id; with wait_ms it also reports completion and the exit code when the command finished in time.",
-			"output=\"log\" (default) keeps exact command bytes in a log file the human can tail; output=\"screen\" leaves output on the terminal for interactive programs.",
+			"output=\"screen\" (default) leaves output on the terminal for human collaboration; output=\"log\" keeps exact command bytes in a log file for machine-readable output.",
 			"Pass session=<task_id> to run the next command in the same shell session (queued after a running one); commands run under POSIX sh.",
 		],
 		parameters: Type.Object({
@@ -404,7 +404,7 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 			cwd: Type.Optional(Type.String({ maxLength: 4096, description: "Working directory inside the current trusted project" })),
 			label: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_LABEL_LENGTH, description: "Human-readable task label" })),
 			session: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Existing task id whose Paseo terminal session is reused" })),
-			output: Type.Optional(Type.Union([Type.Literal("log"), Type.Literal("screen")], { description: "Output sink: log file (default) or terminal screen" })),
+			output: Type.Optional(Type.Union([Type.Literal("log"), Type.Literal("screen")], { description: "Output sink: terminal screen (default) or log file" })),
 			wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: "Wait up to N ms for completion before returning" })),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: BackgroundExecParams, signal, _onUpdate, ctx) {

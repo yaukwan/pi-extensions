@@ -167,7 +167,7 @@ test("generated wrapper records exact output and the real exit code", async () =
 	const home = temporaryHome();
 	const projectRoot = await temporaryProject(home);
 	const service = new PaseoBackgroundTerminalService(new FakeTerminals(), home);
-	const { task_id, summary } = await service.exec({ command: "echo hello; echo oops >&2; exit 3" }, context(projectRoot));
+	const { task_id, summary } = await service.exec({ command: "echo hello; echo oops >&2; exit 3", output: "log" }, context(projectRoot));
 	assert.equal(summary.state, "running");
 	const record = await loadTaskRecord(projectRoot, task_id, home);
 	// The wrapper's own exit code is 0 after a clean record; the task's exit code lives in the status file.
@@ -182,7 +182,7 @@ test("wrapper passes quotes and command substitution through cmd.sh verbatim", a
 	const home = temporaryHome();
 	const projectRoot = await temporaryProject(home);
 	const service = new PaseoBackgroundTerminalService(new FakeTerminals(), home);
-	const { task_id } = await service.exec({ command: "printf '%s\\n' \"a'b $(echo two)\"" }, context(projectRoot));
+	const { task_id } = await service.exec({ command: "printf '%s\\n' \"a'b $(echo two)\"", output: "log" }, context(projectRoot));
 	const record = await loadTaskRecord(projectRoot, task_id, home);
 	await runWrapper(record.dir);
 	const log = await readFile(logPath(record.dir), "utf8");
@@ -194,7 +194,7 @@ test("a stray ) inside the command cannot escape the subshell and still records 
 	const home = temporaryHome();
 	const projectRoot = await temporaryProject(home);
 	const service = new PaseoBackgroundTerminalService(new FakeTerminals(), home);
-	const { task_id } = await service.exec({ command: "echo before\n)\necho after" }, context(projectRoot));
+	const { task_id } = await service.exec({ command: "echo before\n)\necho after", output: "log" }, context(projectRoot));
 	const record = await loadTaskRecord(projectRoot, task_id, home);
 	assert.equal(await runWrapper(record.dir), 0);
 	assert.equal((await statusExit(record.dir)), 1);
@@ -208,7 +208,7 @@ test("group SIGINT emulates Ctrl-C and the trap records 130 within the stop wind
 	const home = temporaryHome();
 	const projectRoot = await temporaryProject(home);
 	const service = new PaseoBackgroundTerminalService(new FakeTerminals(), home);
-	const { task_id } = await service.exec({ command: "echo started; sleep 30" }, context(projectRoot));
+	const { task_id } = await service.exec({ command: "echo started; sleep 30", output: "log" }, context(projectRoot));
 	const record = await loadTaskRecord(projectRoot, task_id, home);
 	const exitCode = await runWrapper(record.dir, "SIGINT");
 	assert.equal(exitCode, 130);
@@ -241,7 +241,7 @@ test("log reads advance a byte cursor, jump to the tail on window overflow, and 
 	const home = temporaryHome();
 	const projectRoot = await temporaryProject(home);
 	const service = new PaseoBackgroundTerminalService(new FakeTerminals(), home);
-	const { task_id } = await service.exec({ command: "true" }, context(projectRoot));
+	const { task_id } = await service.exec({ command: "true", output: "log" }, context(projectRoot));
 	const record = await loadTaskRecord(projectRoot, task_id, home);
 
 	await writeFile(logPath(record.dir), "first\nsecond\n");
@@ -271,7 +271,7 @@ test("screen-mode reads render the captured terminal and trim padding", async ()
 	const projectRoot = await temporaryProject(home);
 	const fake = new FakeTerminals();
 	const service = new PaseoBackgroundTerminalService(fake, home);
-	const { task_id } = await service.exec({ command: "vim", output: "screen" }, context(projectRoot));
+	const { task_id } = await service.exec({ command: "vim" }, context(projectRoot));
 	const record = await loadTaskRecord(projectRoot, task_id, home);
 	fake.captures.set(record.meta.terminal_id, ["$ vim", "screen body", "", "", ""]);
 	assert.equal(await service.read({ task_id }, context(projectRoot)), "$ vim\nscreen body");
@@ -555,7 +555,7 @@ test("summarizeTask maps the three states and exposes the log path only for log 
 	const projectRoot = await temporaryProject(home);
 	try {
 		const service = new PaseoBackgroundTerminalService(new FakeTerminals(), home);
-		const logTask = await service.exec({ command: "true" }, context(projectRoot));
+		const logTask = await service.exec({ command: "true", output: "log" }, context(projectRoot));
 		const logRecord = await loadTaskRecord(projectRoot, logTask.task_id, home);
 		const running = await summarizeTask(logRecord);
 		assert.equal(running.state, "running");
@@ -646,7 +646,7 @@ test("a command reading stdin gets the terminal input instead of /dev/null", asy
 	const home = temporaryHome();
 	const projectRoot = await temporaryProject(home);
 	const service = new PaseoBackgroundTerminalService(new FakeTerminals(), home);
-	const { task_id } = await service.exec({ command: 'read -r line; echo "got:[$line]"' }, context(projectRoot));
+	const { task_id } = await service.exec({ command: 'read -r line; echo "got:[$line]"', output: "log" }, context(projectRoot));
 	const record = await loadTaskRecord(projectRoot, task_id, home);
 	// The daemon hands the wrapper the PTY as stdin; a pipe stands in for it offline.
 	const child = spawn("sh", [join(record.dir, "run.sh")], { stdio: ["pipe", "ignore", "ignore"] });

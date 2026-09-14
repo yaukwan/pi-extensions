@@ -14,7 +14,7 @@ Requires a Pi session running inside a Paseo agent (`PASEO_AGENT_ID` is set by t
 
 - Each background session is a real Paseo terminal: a daemon-owned PTY that survives Pi restarts, visible and take-over-able in the Paseo app (Terminals of the agent's workspace).
 - Each `background_exec` submits one line to the session's shell: `sh <run.sh>`. The wrapper sources your command from `cmd.sh` and records completion out-of-band — nothing is ever printed into the terminal for bookkeeping.
-- Output goes to a log file (`output: "log"`, default: exact bytes, `NO_COLOR`/`TERM=dumb` environment) or stays on the terminal screen (`output: "screen"`: colors and TUI work; read returns rendered lines).
+- Output stays on the terminal screen (`output: "screen"`, default: colors and TUI work; read returns rendered lines) or goes to a log file (`output: "log"`: exact bytes with `NO_COLOR`/`TERM=dumb` environment).
 - Task state is derived on read: `running` (no status file), `exited` (status file with the exit code), `orphaned` (terminal gone). No watchers, no polling loops.
 - Records live under `~/.pi/pi-paseo-background-terminal/<project-hash>/tasks/<task_id>/` (`meta.json`, `run.sh`, `cmd.sh`, `log`, `status`).
 
