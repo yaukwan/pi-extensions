@@ -1,6 +1,6 @@
 # pi-paseo-background-terminal
 
-A Pi extension that runs background tasks in persistent [Paseo](https://paseo.sh) terminal sessions and exposes them through background-task tools.
+A Pi extension for direct commands in persistent [Paseo](https://paseo.sh) terminals that humans and agents can observe and control together.
 
 ## Install
 
@@ -8,25 +8,36 @@ A Pi extension that runs background tasks in persistent [Paseo](https://paseo.sh
 pi install npm:pi-paseo-background-terminal
 ```
 
-Requires a Pi session running inside a Paseo agent (`PASEO_AGENT_ID` is set by the daemon) and a reachable daemon, local to the Pi process.
+Requires a Pi session running inside a Paseo agent (`PASEO_AGENT_ID` is set by the daemon) and a reachable Paseo MCP endpoint.
 
 ## How it works
 
-- Each background session is a real Paseo terminal: a daemon-owned PTY that survives Pi restarts, visible and take-over-able in the Paseo app (Terminals of the agent's workspace).
-- Each `background_exec` submits one line to the session's shell: `sh <run.sh>`. The wrapper sources your command from `cmd.sh` and records completion out-of-band — nothing is ever printed into the terminal for bookkeeping.
-- Output stays on the terminal screen (`output: "screen"`, default: colors and TUI work; read returns rendered lines) or goes to a log file (`output: "log"`: exact bytes with `NO_COLOR`/`TERM=dumb` environment).
-- Task state is derived on read: `running` (no status file), `exited` (status file with the exit code), `orphaned` (terminal gone). No watchers, no polling loops.
-- Records live under `~/.pi/pi-paseo-background-terminal/<project-hash>/tasks/<task_id>/` (`meta.json`, `run.sh`, `cmd.sh`, `log`, `status`).
+- `background_exec` sends the original command through `send_terminal_keys` with `literal: true`, then presses Enter. The command itself appears in the Paseo console.
+- Commands execute in the terminal's default shell. Colors, interactive programs, shell history, `cd`, and `export` retain normal terminal behavior.
+- `background_read` captures rendered terminal scrollback through Paseo. Humans see the same terminal in the app and can type into it directly.
+- A task ID identifies a submission and its terminal. Local storage contains only `meta.json` under `~/.pi/pi-paseo-background-terminal/<project-hash>/tasks/<task_id>/`. No generated scripts, output logs, status files, or completion markers are created.
+- `open` / `closed` describe terminal presence. They do not describe whether a command is running, waiting for input, or finished. Paseo's terminal tools do not report per-command exit codes or completion.
 
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `background_exec` | Run a POSIX shell command; returns an opaque `task_id`. `session=<task_id>` reuses a session's shell (commands queue). `wait_ms` reports completion and the exit code in the same call. |
-| `background_list` | List tasks with derived state; works with the daemon down for finished tasks. |
-| `background_read` | Log mode: new bytes since the last read (`range: "new"` default) or the bounded tail (`range: "all"`). Screen mode: captured terminal lines. |
-| `background_write` | Send PTY keyboard input to a running task (`submit: false` skips the Enter press). |
-| `background_stop` | `interrupt` sends Ctrl-C (exit code 130 via the wrapper's trap; falls back to `terminated` when the trap loses the startup race); `terminate` kills the session terminal. |
+| `background_exec` | `{command, cwd?, label?, session?}`. Type a command and return a `task_id` after sending input. `cwd` applies only when creating a terminal. |
+| `background_list` | `{task_id?, cursor?, limit?}`. List submissions with terminal state (`open` / `closed`). Daemon errors propagate. |
+| `background_read` | `{task_id, output_lines?}`. Capture recent rendered lines, including command echoes, prompts, and shared session history. |
+| `background_write` | `{task_id, input, submit?}`. Send input to the foreground program or shell; `submit: false` skips Enter. |
+| `background_stop` | `{task_id, mode}`. `interrupt` sends Ctrl-C without claiming completion; `terminate` closes the shared terminal. |
+
+Example:
+
+```json
+{
+  "command": "bun run check:all",
+  "label": "check:all"
+}
+```
+
+Use `session=<task_id>` only after observing that its shell is ready. Input goes to whichever program currently owns the terminal; there is no task queue. To change the directory of an existing session, send `cd` in the command. Metadata `cwd` records the requested starting directory for new terminals and the project context for reused submissions; it does not track later shell directory changes.
 
 The `/bg` command provides the same controls:
 
@@ -39,22 +50,26 @@ The `/bg` command provides the same controls:
 /bg clean --confirm
 ```
 
-To watch or take over a task interactively, open its terminal in the Paseo app.
+Cleanup removes records only for terminals that are already closed. Open terminals remain available for human collaboration, even after their commands finish.
 
-## Limits
+## Limits and migration
 
-- At most 16 active sessions per project; commands up to 64 KB; `wait_ms` up to 300 s; reads bounded to 2000 lines / 50 KB per response (a log burst larger than the window drops the head and keeps the tail).
-- Commands run under POSIX `sh`; use `bash -lc '...'` inside the command for shell-specific behavior.
-- Interrupt is Ctrl-C, not a guaranteed kill — a program that ignores SIGINT keeps running; use `terminate`.
-- Same-host daemon and Pi process (the side channel is the local filesystem). Remote daemons are not supported yet.
+- At most 16 tracked open terminals per project. Close or reuse a terminal to free a slot. Commands and writes are limited to 64 KB; commands accept tabs and newlines but reject terminal control characters.
+- Captures are snapshots, bounded by Paseo's scrollback and up to 2000 lines / approximately 50 KB per tool response. They are not raw stdout/stderr or incremental per-command output. Closing a terminal removes access to its capture.
+- Ctrl-C is input delivery, not proof that a command stopped. Programs may ignore it. `terminate` closes the terminal for every submission sharing it.
+- Removed parameters: `output`, `wait_ms`, and `range`. Stale calls reject these parameters instead of silently changing behavior. Refresh the installed extension and its tool definitions before making new calls.
+- Removed result fields: `output`, `log_path`, `exit_code`, and `terminated`. The previous `running` / `exited` / `orphaned` states are replaced by terminal `open` / `closed`.
+- Existing records and generated files are not automatically rewritten or deleted. Their terminal identifiers can still be used while those terminals exist, but old logs and status files are no longer read. An already-running wrapper keeps its original behavior; use a new submission for direct execution. Retain any old logs you need before explicitly cleaning closed records.
 
 ## Development
 
 ```bash
-node --test --experimental-transform-types index.test.ts          # unit
-node --experimental-transform-types service.integration.ts       # fake-daemon HTTP integration
-node --experimental-transform-types live.probe.ts                # real daemon (inside a Paseo agent)
+node --test --experimental-transform-types index.test.ts
+node --experimental-transform-types service.integration.ts
+node --experimental-transform-types live.probe.ts
 ```
+
+The integration test uses real HTTP MCP calls and persistent shells with pipes. The live probe verifies actual Paseo PTY behavior and cleans up only its own terminals and records.
 
 Design notes: [`docs/design.md`](docs/design.md).
 

@@ -1,7 +1,4 @@
-import { setTimeout as delay } from "node:timers/promises";
-import { join } from "node:path";
-
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, truncateTail, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -14,7 +11,6 @@ import {
 	assertWriteParams,
 	MAX_LABEL_LENGTH,
 	MAX_LIST_LIMIT,
-	MAX_WAIT_MS,
 	MAX_OUTPUT_LINES,
 	type BackgroundExecParams,
 	type BackgroundListParams,
@@ -26,19 +22,12 @@ import {
 	assertInsideProject,
 	canonicalProjectRoot,
 	createTaskRecord,
-	generateSubmitLine,
 	listTaskRecords,
 	loadTaskRecord,
-	logPath,
 	newTaskId,
-	projectLogText,
-	readLogSlice,
-	readStatusFile,
 	removeTaskRecord,
 	summarizeTask,
 	taskSummaryText,
-	writeStatusFile,
-	writeTaskMeta,
 	type TaskMeta,
 	type TaskSummary,
 } from "./runner.ts";
@@ -46,12 +35,8 @@ import { isTerminalNotFound, paseoTerminals, type PaseoTerminalClient } from "./
 
 const DEFAULT_LIST_LIMIT = 25;
 const DEFAULT_OUTPUT_LINES = 120;
-const DEFAULT_READ_WAIT_MS = 5_000;
 /** Paseo terminals each own a PTY and a shell; keep the per-project fan-out modest. */
 const MAX_ACTIVE_SESSIONS = 16;
-const STATUS_POLL_INTERVAL_MS = 100;
-/** How long a stop waits for the wrapper's trap to record the exit code. */
-const STOP_CONFIRM_MS = 1_500;
 
 export interface BackgroundListResult {
 	tasks: TaskSummary[];
@@ -67,7 +52,7 @@ export interface BackgroundStopResult {
 	task: TaskSummary;
 	mode: "interrupt" | "terminate";
 	accepted: boolean;
-	reason?: "already_terminal";
+	reason?: "terminal_closed";
 }
 
 export interface TaskCleanupResult {
@@ -158,16 +143,6 @@ export class PaseoBackgroundTerminalService {
 		return new Set(terminals.map((terminal) => terminal.id));
 	}
 
-	private async waitForStatus(dir: string, waitMs: number, signal?: AbortSignal): Promise<void> {
-		const deadline = Date.now() + waitMs;
-		for (;;) {
-			if (await readStatusFile(dir)) return;
-			const remaining = deadline - Date.now();
-			if (remaining <= 0) return;
-			await delay(Math.min(STATUS_POLL_INTERVAL_MS, remaining), undefined, { signal });
-		}
-	}
-
 	async exec(params: BackgroundExecParams, ctx: ExtensionContext, signal?: AbortSignal): Promise<{ task_id: string; summary: TaskSummary }> {
 		assertProjectTrusted(ctx);
 		assertExecParams(params);
@@ -188,7 +163,7 @@ export class PaseoBackgroundTerminalService {
 			const alive = await this.aliveTerminalIds(callerAgentId, signal);
 			const activeSessions = new Set<string>();
 			for (const record of records) {
-				if (!(await readStatusFile(record.dir)) && alive.has(record.meta.terminal_id)) activeSessions.add(record.meta.terminal_id);
+				if (alive.has(record.meta.terminal_id)) activeSessions.add(record.meta.terminal_id);
 			}
 			if (activeSessions.size >= MAX_ACTIVE_SESSIONS) {
 				throw new Error(`too_many_active_sessions: ${MAX_ACTIVE_SESSIONS} Paseo terminal sessions are active. Stop one, or pass session=<task_id> to reuse one.`);
@@ -204,21 +179,18 @@ export class PaseoBackgroundTerminalService {
 			label: taskLabel(params.label, params.command),
 			command: params.command,
 			cwd,
-			output: params.output ?? "screen",
 			created_at: new Date().toISOString(),
-			read_offset: 0,
 		};
-		const dir = await createTaskRecord(projectRoot, meta, this.home);
 		try {
-			await this.terminals.sendKeys({ terminalId, keys: generateSubmitLine(join(dir, "run.sh")), literal: true, callerAgentId, signal });
+			await createTaskRecord(projectRoot, meta, this.home);
+			await this.terminals.sendKeys({ terminalId, keys: params.command, literal: true, callerAgentId, signal });
 			await this.terminals.sendKeys({ terminalId, keys: "Enter", callerAgentId, signal });
 		} catch (error) {
 			if (createdTerminal) await this.terminals.killTerminal({ terminalId, callerAgentId }).catch(() => {});
 			await removeTaskRecord(projectRoot, meta.task_id, this.home);
 			throw error;
 		}
-		if (params.wait_ms !== undefined && params.wait_ms > 0) await this.waitForStatus(dir, params.wait_ms, signal);
-		const summary = await summarizeTask({ meta, dir }, true);
+		const summary: TaskSummary = { ...meta, state: "open" };
 		return { task_id: meta.task_id, summary };
 	}
 
@@ -231,15 +203,8 @@ export class PaseoBackgroundTerminalService {
 		let records = await listTaskRecords(projectRoot, this.home);
 		if (params.task_id !== undefined) records = records.filter((record) => record.meta.task_id === params.task_id);
 
-		const statuses = await Promise.all(records.map((record) => readStatusFile(record.dir)));
-		let alive: Set<string> | undefined;
-		if (statuses.some((status) => !status)) {
-			// Orphan detection needs the daemon; a daemon that is down leaves states reported as running.
-			alive = await this.aliveTerminalIds(parentAgentId()).catch(() => undefined);
-		}
-		const tasks = await Promise.all(records.map(async (record, index) =>
-			summarizeTask(record, statuses[index] ? undefined : alive?.has(record.meta.terminal_id)),
-		));
+		const alive = records.length > 0 ? await this.aliveTerminalIds(parentAgentId()) : new Set<string>();
+		const tasks = records.map((record) => summarizeTask(record, alive.has(record.meta.terminal_id)));
 		const visible = tasks.filter((task) => followsCursor(task, cursor));
 		const page = visible.slice(0, limit);
 		return { tasks: page, next_cursor: visible.length > page.length && page.length > 0 ? encodeCursor(page[page.length - 1] as TaskSummary) : undefined };
@@ -251,30 +216,15 @@ export class PaseoBackgroundTerminalService {
 		const { projectRoot } = await this.projectPaths(ctx);
 		const record = await loadTaskRecord(projectRoot, params.task_id, this.home);
 		const lines = clamp(params.output_lines, DEFAULT_OUTPUT_LINES, 1, MAX_OUTPUT_LINES);
-		const range = params.range ?? "new";
-
-		if (record.meta.output === "screen") {
-			const waitMs = clamp(params.wait_ms, DEFAULT_READ_WAIT_MS, 0, MAX_WAIT_MS);
-			if (!(await readStatusFile(record.dir)) && waitMs > 0) await this.waitForStatus(record.dir, waitMs, signal);
-			const capture = await this.terminals.captureTerminal({
-				terminalId: record.meta.terminal_id,
-				scrollback: true,
-				callerAgentId: parentAgentId(),
-				signal,
-			}).catch((error: unknown) => {
-				if (isTerminalNotFound(error)) return { lines: [], totalLines: 0 };
-				throw error;
-			});
-			return trimTrailingBlanks(capture.lines).slice(-lines).join("\n");
-		}
-
-		const slice = await readLogSlice(logPath(record.dir), record.meta.read_offset, range);
-		if (slice.nextOffset !== record.meta.read_offset) {
-			await writeTaskMeta(record.dir, { ...record.meta, read_offset: slice.nextOffset });
-		}
-		const projection = projectLogText(slice.text, lines);
-		const notice = slice.windowTruncated ? "[older output dropped by the read window]\n" : "";
-		return notice + projection.content;
+		const capture = await this.terminals.captureTerminal({
+			terminalId: record.meta.terminal_id,
+			scrollback: true,
+			callerAgentId: parentAgentId(),
+			signal,
+		});
+		const text = trimTrailingBlanks(capture.lines).slice(-lines).join("\n");
+		const result = truncateTail(text, { maxLines: lines, maxBytes: DEFAULT_MAX_BYTES });
+		return result.truncated ? `[older terminal output omitted]\n${result.content}` : result.content;
 	}
 
 	async write(params: BackgroundWriteParams, ctx: ExtensionContext, signal?: AbortSignal): Promise<BackgroundWriteResult> {
@@ -283,9 +233,6 @@ export class PaseoBackgroundTerminalService {
 		const callerAgentId = parentAgentId();
 		const { projectRoot } = await this.projectPaths(ctx);
 		const record = await loadTaskRecord(projectRoot, params.task_id, this.home);
-		if (await readStatusFile(record.dir)) {
-			throw new Error(`task_not_running: Background task ${params.task_id} already finished. Use background_read to inspect it or background_exec to start a new task.`);
-		}
 		try {
 			await this.terminals.sendKeys({ terminalId: record.meta.terminal_id, keys: params.input, literal: true, callerAgentId, signal });
 			if (params.submit !== false) {
@@ -293,11 +240,11 @@ export class PaseoBackgroundTerminalService {
 			}
 		} catch (error) {
 			if (isTerminalNotFound(error)) {
-				throw new Error(`task_not_running: Background task ${params.task_id} has no live Paseo terminal (orphaned). Use background_read for its recorded output.`);
+				throw new Error(`terminal_closed: Background task ${params.task_id} has no live Paseo terminal. Start a new session.`);
 			}
 			throw error;
 		}
-		return { task: await summarizeTask(record, true), accepted: true };
+		return { task: summarizeTask(record, true), accepted: true };
 	}
 
 	async stop(params: BackgroundStopParams, ctx: ExtensionContext, signal?: AbortSignal): Promise<BackgroundStopResult> {
@@ -306,75 +253,36 @@ export class PaseoBackgroundTerminalService {
 		const callerAgentId = parentAgentId();
 		const { projectRoot } = await this.projectPaths(ctx);
 		const record = await loadTaskRecord(projectRoot, params.task_id, this.home);
-		if (await readStatusFile(record.dir)) {
-			return { task: await summarizeTask(record), mode: params.mode, accepted: false, reason: "already_terminal" };
+		const alive = await this.aliveTerminalIds(callerAgentId, signal);
+		if (!alive.has(record.meta.terminal_id)) {
+			return { task: summarizeTask(record, false), mode: params.mode, accepted: false, reason: "terminal_closed" };
 		}
 		if (params.mode === "interrupt") {
-			let alive = true;
 			try {
 				await this.terminals.sendKeys({ terminalId: record.meta.terminal_id, keys: "C-c", callerAgentId, signal });
 			} catch (error) {
 				if (!isTerminalNotFound(error)) throw error;
-				alive = false;
+				return { task: summarizeTask(record, false), mode: params.mode, accepted: false, reason: "terminal_closed" };
 			}
-			await this.waitForStatus(record.dir, STOP_CONFIRM_MS);
-			// During the first milliseconds of startup the wrapper can take the default
-			// SIGINT action before its traps install. The command is gone either way, so
-			// record the death instead of leaving a task that lies about running.
-			if (alive && !(await readStatusFile(record.dir))) await writeStatusFile(record.dir, "terminated");
-			return { task: await summarizeTask(record, alive), mode: params.mode, accepted: true };
+			return { task: summarizeTask(record, true), mode: params.mode, accepted: true };
 		}
 		await this.terminals.killTerminal({ terminalId: record.meta.terminal_id, callerAgentId, signal });
-		// Give the wrapper's HUP trap a moment to record the real exit code.
-		await this.waitForStatus(record.dir, STOP_CONFIRM_MS);
-		if (!(await readStatusFile(record.dir))) await writeStatusFile(record.dir, "terminated");
-		return { task: await summarizeTask(record, false), mode: params.mode, accepted: true };
+		return { task: summarizeTask(record, false), mode: params.mode, accepted: true };
 	}
 
 	async cleanup(ctx: ExtensionContext, confirm: boolean): Promise<TaskCleanupResult> {
 		assertProjectTrusted(ctx);
 		const { projectRoot } = await this.projectPaths(ctx);
 		const records = await listTaskRecords(projectRoot, this.home);
-		const eligible: typeof records = [];
-		let orphans: typeof records = [];
-		for (const record of records) {
-			if (await readStatusFile(record.dir)) eligible.push(record);
-			else orphans.push(record);
-		}
-		if (orphans.length > 0) {
-			// Orphaned sessions are terminal too, but proving them needs the daemon;
-			// with the daemon down only recorded finishes are eligible.
-			const alive = await this.aliveTerminalIds(parentAgentId()).catch(() => undefined);
-			if (alive) {
-				eligible.push(...orphans.filter((record) => !alive.has(record.meta.terminal_id)));
-				orphans = orphans.filter((record) => alive.has(record.meta.terminal_id));
-			}
-		}
+		const alive = records.length > 0 ? await this.aliveTerminalIds(parentAgentId()) : new Set<string>();
+		const eligible = records.filter((record) => !alive.has(record.meta.terminal_id));
 		if (!confirm) return { eligible: eligible.length, removed: 0 };
-
-		let callerAgentId: string | undefined;
-		try { callerAgentId = parentAgentId(); } catch { callerAgentId = undefined; }
-		const keptTerminals = new Set(records.filter((record) => !eligible.includes(record)).map((record) => record.meta.terminal_id));
-		for (const record of eligible) {
-			// A session outlives its last task on purpose (the human may still look at it);
-			// cleanup only releases terminals no record references any more.
-			if (callerAgentId && !keptTerminals.has(record.meta.terminal_id)) {
-				await this.terminals.killTerminal({ terminalId: record.meta.terminal_id, callerAgentId }).catch(() => {});
-			}
-			await removeTaskRecord(projectRoot, record.meta.task_id, this.home);
-		}
+		for (const record of eligible) await removeTaskRecord(projectRoot, record.meta.task_id, this.home);
 		return { eligible: eligible.length, removed: eligible.length };
 	}
 }
 
 export const backgroundTerminalService = new PaseoBackgroundTerminalService();
-
-export function execResultText(taskId: string, summary: TaskSummary): string {
-	if (summary.state === "exited") {
-		return `${taskId} exited${summary.exit_code === undefined ? "" : ` exit=${summary.exit_code}`}${summary.terminated ? " terminated" : ""}`;
-	}
-	return taskId;
-}
 
 function renderResult(result: { content: Array<{ type: string; text?: string }>; details: unknown }, theme: any, expanded: boolean): Text {
 	const details = result.details as Partial<BackgroundListResult & { task?: TaskSummary; summary?: TaskSummary }>;
@@ -382,7 +290,7 @@ function renderResult(result: { content: Array<{ type: string; text?: string }>;
 	const task = details.task ?? details.summary;
 	if (!task) return new Text(theme.fg("toolTitle", result.content[0]?.text ?? ""), 0, 0);
 	if (!expanded) return new Text(theme.fg("toolTitle", `${task.label} [${task.state}]`), 0, 0);
-	const color = task.state === "orphaned" ? "error" : task.state === "exited" && task.exit_code !== 0 && !task.terminated ? "warning" : "success";
+	const color = task.state === "closed" ? "warning" : "success";
 	return new Text(theme.fg(color, taskSummaryText(task)), 0, 0);
 }
 
@@ -392,24 +300,23 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 	pi.registerTool({
 		name: "background_exec",
 		label: "Background Exec",
-		description: "Run a POSIX shell command in a persistent Paseo terminal session and track it as a background task.",
+		description: "Type a command directly into a persistent Paseo terminal and press Enter. Output stays visible for human collaboration.",
 		promptSnippet: "Start a command in a persistent Paseo background terminal session",
 		promptGuidelines: [
-			"background_exec returns a task_id; with wait_ms it also reports completion and the exit code when the command finished in time.",
-			"output=\"screen\" (default) leaves output on the terminal for human collaboration; output=\"log\" keeps exact command bytes in a log file for machine-readable output.",
-			"Pass session=<task_id> to run the next command in the same shell session (queued after a running one); commands run under POSIX sh.",
+			"Returns a task_id after sending input, not after command completion. Paseo does not report per-command exit codes.",
+			"Commands run directly in the terminal's default shell; cd and export persist. Output is read through Paseo capture_terminal.",
+			"Pass session=<task_id> only when the shell is ready. Input goes to the foreground process; there is no task queue. Omit cwd when reusing a session.",
+			"Use the command's own output to assess completion. Do not append log redirection or generated shell wrappers.",
 		],
 		parameters: Type.Object({
-			command: Type.String({ minLength: 1, maxLength: 65_536, description: "POSIX shell command to run" }),
+			command: Type.String({ minLength: 1, maxLength: 65_536, description: "Command to type directly into the terminal shell" }),
 			cwd: Type.Optional(Type.String({ maxLength: 4096, description: "Working directory inside the current trusted project" })),
 			label: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_LABEL_LENGTH, description: "Human-readable task label" })),
 			session: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Existing task id whose Paseo terminal session is reused" })),
-			output: Type.Optional(Type.Union([Type.Literal("log"), Type.Literal("screen")], { description: "Output sink: terminal screen (default) or log file" })),
-			wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: "Wait up to N ms for completion before returning" })),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: BackgroundExecParams, signal, _onUpdate, ctx) {
 			const result = await service.exec(params, ctx, signal);
-			return { content: [{ type: "text", text: execResultText(result.task_id, result.summary) }], details: result };
+			return { content: [{ type: "text", text: result.task_id }], details: result };
 		},
 		renderCall(args, theme) {
 			const input = args as Partial<BackgroundExecParams>;
@@ -421,9 +328,9 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 	pi.registerTool({
 		name: "background_list",
 		label: "Background List",
-		description: "List tracked background tasks or get one task by id; states are derived from side-channel files and terminal presence.",
+		description: "List tracked submissions with terminal state: open or closed. This does not indicate command completion.",
 		promptSnippet: "List persistent Paseo background tasks",
-		promptGuidelines: ["background_list works while the Paseo daemon is down for finished tasks; running tasks fall back to reported state."],
+		promptGuidelines: ["States describe terminal presence only, not running commands. Daemon failures are reported as errors."],
 		parameters: Type.Object({
 			task_id: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
 			cursor: Type.Optional(Type.String({ maxLength: 512 })),
@@ -439,17 +346,15 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 	pi.registerTool({
 		name: "background_read",
 		label: "Background Read",
-		description: "Read one background task's output: log-mode tasks return exact bytes since the last read, screen-mode tasks return rendered terminal lines.",
+		description: "Capture recent rendered lines from the task's Paseo terminal, including commands, prompts, and shared session history.",
 		promptSnippet: "Read output from a persistent Paseo background task",
 		promptGuidelines: [
-			"Log mode advances a per-task byte cursor; range=\"all\" returns the bounded tail without rewinding earlier reads.",
-			"background_read only reports output; use background_list for state, exit codes, and the log path.",
+			"Reads are snapshots of terminal scrollback, not incremental output or a per-command log.",
+			"Use background_list for terminal presence. Captured output may be truncated by Paseo scrollback limits.",
 		],
 		parameters: Type.Object({
 			task_id: Type.String({ minLength: 1, maxLength: 128 }),
-			wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS })),
 			output_lines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_OUTPUT_LINES })),
-			range: Type.Optional(Type.Union([Type.Literal("new"), Type.Literal("all")], { description: "Log mode: new bytes since the last read (default) or the bounded tail" })),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: BackgroundReadParams, signal, _onUpdate, ctx) {
 			return { content: [{ type: "text", text: await service.read(params, ctx, signal) }], details: undefined };
@@ -459,7 +364,7 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 	pi.registerTool({
 		name: "background_write",
 		label: "Background Write",
-		description: "Send input to a running background task's terminal session.",
+		description: "Send input to an open Paseo terminal's foreground program or shell.",
 		promptSnippet: "Send input to a persistent Paseo background task",
 		promptGuidelines: ["background_write presses Enter unless submit is false. It is PTY keyboard input, not a stdin pipe: the foreground process must be reading."],
 		parameters: Type.Object({
@@ -480,8 +385,8 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 		description: "Interrupt a background task with Ctrl-C, or terminate it by killing its Paseo terminal.",
 		promptSnippet: "Interrupt or terminate a persistent Paseo background task",
 		promptGuidelines: [
-			"Use mode=interrupt for Ctrl+C (the wrapper records exit code 130) and mode=terminate to kill the session terminal.",
-			"Terminated tasks keep their log file; a task whose trap could not run reports terminated.",
+			"Use mode=interrupt to send Ctrl+C; acceptance does not confirm that the foreground command stopped.",
+			"Use mode=terminate to close the terminal shared by all its submissions. Captured output is unavailable after closure.",
 		],
 		parameters: Type.Object({
 			task_id: Type.String({ minLength: 1, maxLength: 128 }),
@@ -503,7 +408,7 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 				if (action === "clean") {
 					const confirmed = id === "--confirm";
 					const result = await service.cleanup(ctx, confirmed);
-					ctx.ui.notify(confirmed ? `Removed ${result.removed} finished background task(s).` : `${result.eligible} finished background task(s) can be cleaned. Run /bg clean --confirm.`, "info");
+					ctx.ui.notify(confirmed ? `Removed ${result.removed} closed-terminal record(s).` : `${result.eligible} closed-terminal record(s) can be cleaned. Run /bg clean --confirm.`, "info");
 					return;
 				}
 				if (action === "list") { ctx.ui.notify(resultText(await service.list({}, ctx)), "info"); return; }
