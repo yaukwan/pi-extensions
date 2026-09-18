@@ -56,11 +56,13 @@ Example request shape:
 
 ### Choosing a model
 
-`subagent_run` resolves its target in this order:
+`subagent_run` accepts exactly one target selection:
 
-1. `provider` — an explicit `provider` or `provider/model`, for example `codex` or `pi/nikoapi/gpt-5.6-sol`.
-2. `profile` — a Paseo agent profile, by name or id. Run `subagent_presets` (or `/subagent presets`) to see what the host has, including the profile's `notes` guidance.
-3. Neither — inherit the calling agent's own provider, model, and thinking level.
+- Omit both `provider` and `profile` to inherit the calling agent's provider, model, and thinking level.
+- Pass `provider` for an explicit Paseo `provider` or `provider/model`, for example `codex` or `pi/nikoapi/gpt-5.6-sol`.
+- Pass `profile` for a Paseo agent profile by name or id. Run `subagent_presets` (or `/subagent presets`) to see actual profiles and their `notes` guidance.
+
+`provider` and `profile` are mutually exclusive; passing both is rejected. `default` is not a special profile value.
 
 `thinking` overrides whatever the profile or the parent supplied. Profiles keep their `thinkingOptionId` and, when present, their `modeId` and feature values. The package has no configuration of its own: Paseo's profiles are the single source of truth.
 

@@ -216,6 +216,7 @@ interface RegisteredTool {
 	name: string;
 	execute?: (...args: unknown[]) => Promise<unknown>;
 	parameters?: { properties?: Record<string, unknown> };
+	promptGuidelines?: string[];
 }
 
 function registeredTools(): RegisteredTool[] {
@@ -426,6 +427,11 @@ test("registers the six subagent tools", () => {
 	const runParams = tools.find((entry) => entry.name === "subagent_run")?.parameters?.properties;
 	assert.ok(runParams && "profile" in runParams && "thinking" in runParams);
 	assert.ok(runParams && !("cwd" in runParams) && !("model_preset" in runParams));
+	const runTool = tools.find((entry) => entry.name === "subagent_run");
+	assert.match(runTool?.promptGuidelines?.join(" ") ?? "", /omit both profile and provider/);
+	assert.match(runTool?.promptGuidelines?.join(" ") ?? "", /Never pass profile and provider together/);
+	assert.match(JSON.stringify(runParams?.profile), /mutually exclusive with provider/);
+	assert.match(JSON.stringify(runParams?.provider), /mutually exclusive with profile/);
 });
 
 test("inherits provider, model, and thinking from the calling agent", async () => {

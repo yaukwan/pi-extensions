@@ -401,15 +401,16 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 		promptSnippet: "Start an asynchronous delegated subagent tracked by Paseo",
 		promptGuidelines: [
 			"The subagent is a full Paseo agent in the user's Subagents track; Paseo notifies this session when it finishes, errors, or needs permission, so do not poll for status.",
-			"profile selects a Paseo agent profile (see subagent_presets); omit profile and provider to inherit this session's provider, model, and thinking level.",
+			"For subagent_run, omit both profile and provider to inherit this session's provider, model, and thinking level; otherwise pass exactly one: profile from subagent_presets or an explicit provider or provider/model.",
+			"Never pass profile and provider together. The value `default` is not a special profile; use subagent_presets to find an actual profile name or id.",
 			"Subagents share the caller's working directory. Use subagent_wait to block for results and subagent_stop to interrupt or archive one.",
 		],
 		parameters: Type.Object({
 			prompt: Type.String({ minLength: 1, maxLength: MAX_PROMPT_BYTES, description: "Focused task for the delegated agent" }),
 			role: Type.Optional(Type.Union([Type.Literal("scout"), Type.Literal("reviewer"), Type.Literal("worker")], { default: "scout" })),
 			name: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_NAME_LENGTH, description: "Display name" })),
-			profile: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Paseo agent profile name or id" })),
-			provider: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Provider, or provider/model, overriding any profile" })),
+			profile: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Paseo agent profile name or id; mutually exclusive with provider" })),
+			provider: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Explicit Paseo provider or provider/model; mutually exclusive with profile" })),
 			thinking: Type.Optional(Type.String({ minLength: 1, maxLength: 64, description: "Thinking level override, for example xhigh. Paseo ids are provider-specific; omit to use the profile's or the parent's level." })),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: SubagentRunParams, signal, _onUpdate, ctx) {

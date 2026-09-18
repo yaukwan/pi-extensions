@@ -51,11 +51,13 @@ Field mapping onto `create_agent`, which has no profile parameter (documented in
 | `featureValues` | `settings.features` |
 | `notes` | orchestrator selection guidance; the task goes in `initialPrompt` |
 
-`subagent_run` resolves its target in this order:
+`subagent_run` accepts exactly one target selection:
 
-1. `provider` argument (`provider` or `provider/model`) — explicit override.
-2. `profile` argument (profile name or id) — resolved through `list_profiles`.
-3. Neither — inherit the calling agent's own `provider`, `model`, and `effectiveThinkingOptionId` from `get_agent_status`.
+- Neither `provider` nor `profile` — inherit the calling agent's `provider`, `model`, and `effectiveThinkingOptionId` from `get_agent_status`.
+- `provider` argument (`provider` or `provider/model`) — use an explicit Paseo provider.
+- `profile` argument (profile name or id) — resolve it through `list_profiles`.
+
+`provider` and `profile` are mutually exclusive; passing both is rejected. `default` is not a special profile value.
 
 An explicit `thinking` argument overrides whatever the profile or the parent supplied. Paseo thinking ids are provider-specific, so the profile's and the parent's ids are forwarded as-is while an explicit override is passed through unchanged. `provider` and `profile` together are rejected as ambiguous. `provider` must be `provider` or `provider/model` with both parts non-empty: `/model`, `pi/`, and a blank value fail locally as `invalid_arguments` instead of reaching the daemon, which answers with an opaque `MCP error -32602` for the same input.
 
