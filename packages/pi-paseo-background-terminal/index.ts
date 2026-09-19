@@ -300,10 +300,12 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 	pi.registerTool({
 		name: "background_exec",
 		label: "Background Exec",
-		description: "Type a command directly into a persistent Paseo terminal and press Enter. Output stays visible for human collaboration.",
+		description: "Run a command in a persistent Paseo terminal that humans can watch and type into. Returns a task_id immediately, not the command result.",
 		promptSnippet: "Start a command in a persistent Paseo background terminal session",
 		promptGuidelines: [
-			"Returns a task_id after sending input, not after command completion. Paseo does not report per-command exit codes.",
+			"Use background_exec for interactive programs and work meant to keep running while you do other things. When the next step needs a command's result or exit code, use the blocking bash tool instead.",
+			"background_exec returns a task_id after sending input, not after command completion. Paseo does not report per-command exit codes.",
+			"Never sleep or idle-poll to wait for background output. Continue other work and call background_read when the output is actually needed.",
 			"Commands run directly in the terminal's default shell; cd and export persist. Output is read through Paseo capture_terminal.",
 			"Pass session=<task_id> only when the shell is ready. Input goes to the foreground process; there is no task queue. Omit cwd when reusing a session.",
 			"Use the command's own output to assess completion. Do not append log redirection or generated shell wrappers.",
@@ -349,6 +351,7 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 		description: "Capture recent rendered lines from the task's Paseo terminal, including commands, prompts, and shared session history.",
 		promptSnippet: "Read output from a persistent Paseo background task",
 		promptGuidelines: [
+			"background_read returns a snapshot, not a wait. If the output is not ready, do other work instead of sleeping and read again later.",
 			"Reads are snapshots of terminal scrollback, not incremental output or a per-command log.",
 			"Use background_list for terminal presence. Captured output may be truncated by Paseo scrollback limits.",
 		],

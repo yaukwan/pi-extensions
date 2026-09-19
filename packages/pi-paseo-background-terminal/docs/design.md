@@ -1,6 +1,6 @@
 # Direct Paseo terminal design
 
-This extension exposes Paseo's terminal capabilities through five `background_*` tools. Its purpose is human–agent collaboration in the same visible console.
+This extension exposes Paseo's terminal capabilities through five `background_*` tools. Its purpose is human–agent collaboration in the same visible console. The tools are non-blocking by design: an agent that needs a command's result before its next step should use the blocking bash tool instead of idling on a background terminal.
 
 ## Execution and output
 

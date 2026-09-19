@@ -16,6 +16,7 @@ Requires a Pi session running inside a Paseo agent (`PASEO_AGENT_ID` is set by t
 - Commands execute in the terminal's default shell. Colors, interactive programs, shell history, `cd`, and `export` retain normal terminal behavior.
 - `background_read` captures rendered terminal scrollback through Paseo. Humans see the same terminal in the app and can type into it directly.
 - A task ID identifies a submission and its terminal. Local storage contains only `meta.json` under `~/.pi/pi-paseo-background-terminal/<project-hash>/tasks/<task_id>/`. No generated scripts, output logs, status files, or completion markers are created.
+- Use these terminals for interactive programs and work meant to run while the agent does other things. A command whose result the next step needs belongs in the blocking bash tool: `background_*` tools never wait and never report exit codes.
 - `open` / `closed` describe terminal presence. They do not describe whether a command is running, waiting for input, or finished. Paseo's terminal tools do not report per-command exit codes or completion.
 
 ## Tools
