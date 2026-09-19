@@ -31,7 +31,7 @@ Requirements:
 | `subagent_read` | Read a subagent's activity, optionally waiting for it to settle. Archived subagents return a status line instead (see Lifecycle). |
 | `subagent_wait` | Wait for one or more subagents (`all` or `any`) with a shared deadline. |
 | `subagent_stop` | Interrupt a subagent, or terminate it by archiving it out of the track. |
-| `subagent_presets` | List the Paseo agent profiles available as presets, including their notes. |
+| `subagent_presets` | List Paseo profiles with ready-to-use `profile` values and selection notes. |
 
 Human control is also available through:
 
@@ -48,7 +48,7 @@ Example request shape:
 ```json
 {
   "prompt": "Inspect the authentication flow and report the highest-risk defects.",
-  "role": "scout",
+  "name": "auth-review",
   "name": "auth-review",
   "profile": "Reviewer"
 }
@@ -56,13 +56,18 @@ Example request shape:
 
 ### Choosing a model
 
-`subagent_run` accepts exactly one target selection:
+`subagent_run` takes one optional `profile`:
 
-- Omit both `provider` and `profile` to inherit the calling agent's provider, model, and thinking level.
-- Pass `provider` for an explicit Paseo `provider` or `provider/model`, for example `codex` or `pi/nikoapi/gpt-5.6-sol`.
-- Pass `profile` for a Paseo agent profile by name or id. Run `subagent_presets` (or `/subagent presets`) to see actual profiles and their `notes` guidance.
+| Value | Behavior |
+| --- | --- |
+| Omitted | Inherit the calling agent's provider, model, and thinking level. |
+| `"<profile-name-or-id>"` | Select a saved Paseo profile, e.g. `"Reviewer"` or `"agent_profile_review"`. |
 
-`provider` and `profile` are mutually exclusive; passing both is rejected. `default` is not a special profile value.
+Call `subagent_presets` (or `/subagent presets`) and copy the `profile` value from its JSON fragment, e.g. `{"profile":"agent_profile_review"}`. Profile IDs avoid ambiguity when names resemble task roles. There is no raw `provider` or `provider/model` argument any more: Paseo profiles are the single source of runtime configuration, so a runtime without a saved profile is first created as a profile in Paseo.
+
+There is no `role` argument. Task intent — such as read-only — belongs in `prompt` itself; it is advisory, grants no permissions, and delegation is not a sandbox. Bare `scout`, `default`, `openai`, and `inherit` are not valid profile values and fail with `profile_not_found`; a blank profile fails locally with `invalid_arguments`.
+
+Migration: the old top-level `provider` argument and the `target` experiment have been removed and are rejected by the schema. Replace them with one `profile`; no automatic precedence or fallback is applied. Run `/reload` after updating the installed extension so Pi exposes the new tool definition. An older npm installation must be updated first; editing a separate checkout does not update it.
 
 `thinking` overrides whatever the profile or the parent supplied. Profiles keep their `thinkingOptionId` and, when present, their `modeId` and feature values. The package has no configuration of its own: Paseo's profiles are the single source of truth.
 
@@ -84,7 +89,7 @@ An archived subagent's transcript is not returned by `subagent_read` or `subagen
 | --- | --- | --- |
 | Child execution | One-shot `pi --print` in a Herdr pane | Full Paseo agent owned by the daemon |
 | Providers | Pi only | Any provider the daemon has enabled |
-| Role enforcement | Hard `--tools` allowlist per role | Prompt-level; a real mode only where the provider exposes one |
+| Task roles | Hard `--tools` allowlist per role | None; intent such as read-only goes in the prompt |
 | Human visibility | Herdr pane | Paseo Subagents track: watch, steer, approve, detach |
 | Working directory | Per-subagent `cwd` inside the project | The caller's `cwd`; isolation needs a separate workspace |
 | Steering | None; one-shot process | Follow-up prompts, permission decisions, detach in Paseo |
@@ -107,7 +112,7 @@ Resolution order is `PASEO_MCP_URL` → `PASEO_HOST` → the daemon's recorded l
 
 - Every read, wait, and stop call verifies at the daemon that the target's `paseo.parent-agent-id` equals this session's agent id. Paseo itself performs no such check, so the extension never issues a lifecycle call against an unverified id.
 - `subagent_run` requires a trusted project, refuses to run outside a Paseo agent, and caps concurrently active children at eight.
-- Children inherit the caller's workspace, so `worker` subagents edit the same files as the parent. Treat the role as intent, not as a sandbox.
+- Children inherit the caller's workspace and edit the same files as the parent. Delegation is not a sandbox.
 - Paseo's per-provider tool policy is not a security boundary for an agent with shell access, and this extension reaches the daemon directly. Its own tool surface — six tools, no kill, no workspace or schedule management — is the boundary.
 - Note that a daemon listening on `0.0.0.0` without a password exposes its agent control plane to the network. Prefer loopback or a password.
 

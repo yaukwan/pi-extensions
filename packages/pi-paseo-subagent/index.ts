@@ -19,20 +19,16 @@ const ARCHIVED_WINDOW_HOURS = 24 * 30;
 const SESSION_LABEL_KEY = "pi-paseo-subagent";
 const PARENT_AGENT_ID_LABEL = "paseo.parent-agent-id";
 const ACTIVE_STATUSES = ["initializing", "running"];
-const ROLES = ["scout", "reviewer", "worker"] as const;
 const ARCHIVED_TRANSCRIPT_NOTE =
 	"archived: this subagent was removed from the track, and reading it here would resume it on the daemon (re-adding it to the list and re-firing its finish notification). Inspect it in Paseo instead.";
 
-export type SubagentRole = typeof ROLES[number];
 /** Overridable so tests do not have to wait out a real poll interval. */
 export const subagentTiming = { pollIntervalMs: 500 };
 
 export interface SubagentRunParams {
 	prompt: string;
-	role?: SubagentRole;
 	name?: string;
 	profile?: string;
-	provider?: string;
 	thinking?: string;
 }
 
@@ -71,7 +67,6 @@ export interface AgentProfile {
 export interface SubagentSummary {
 	subagent_id: string;
 	name: string;
-	role?: SubagentRole;
 	status: string;
 	provider: string;
 	model?: string;
@@ -126,16 +121,9 @@ export function sessionKey(ctx: ExtensionContext): string {
 	return raw.replace(/[^A-Za-z0-9._-]/g, "-").slice(-120);
 }
 
-export function subagentTitle(role: SubagentRole, name?: string): string {
-	return `${role}: ${name?.trim() || "task"}`;
-}
-
-export function parseSubagentTitle(title: string): { role?: SubagentRole; name: string } {
-	const trimmed = title.trim();
-	const [prefix, ...rest] = trimmed.split(":");
-	const role = prefix && (ROLES as readonly string[]).includes(prefix) ? prefix as SubagentRole : undefined;
-	if (!role) return { name: trimmed };
-	return { role, name: rest.join(":").trim() || "task" };
+/** The daemon has no separate name field; the agent title is the display name. */
+export function titleName(title: string | undefined): string {
+	return title?.trim() || "task";
 }
 
 /** Accepts `provider` or `provider/model`. */
@@ -201,11 +189,9 @@ export function parseAgentSnapshot(value: unknown): AgentSnapshot {
 }
 
 export function summarizeSnapshot(snapshot: AgentSnapshot): SubagentSummary {
-	const { role, name } = parseSubagentTitle(snapshot.title ?? "");
 	return {
 		subagent_id: snapshot.id,
-		name,
-		...(role ? { role } : {}),
+		name: titleName(snapshot.title),
 		status: snapshot.status,
 		provider: providerSelector(snapshot.provider, snapshot.model),
 		...(snapshot.model ? { model: snapshot.model } : {}),
@@ -224,11 +210,9 @@ export function parseChildren(value: unknown, parentId: string): SubagentSummary
 		const id = asString(entry.id);
 		const labels = isRecord(entry.labels) ? entry.labels : {};
 		if (!id || asString(labels[PARENT_AGENT_ID_LABEL]) !== parentId) continue;
-		const { role, name } = parseSubagentTitle(asString(entry.title) ?? "");
 		children.push({
 			subagent_id: id,
-			name,
-			...(role ? { role } : {}),
+			name: titleName(asString(entry.title)),
 			status: asString(entry.status) ?? "unknown",
 			provider: providerSelector(asString(entry.provider) ?? "", asString(entry.model)),
 			...(asString(entry.model) ? { model: asString(entry.model) as string } : {}),
@@ -269,7 +253,7 @@ function isSettled(child: SubagentSummary): boolean {
 function summaryText(child: SubagentSummary): string {
 	const attention = child.attentionReason ? ` attention=${child.attentionReason}` : "";
 	const archived = child.archived ? " archived" : "";
-	return `${child.subagent_id} [${child.status}] ${child.role ?? "-"} ${child.name}${attention}${archived}`;
+	return `${child.subagent_id} [${child.status}] ${child.name}${attention}${archived}`;
 }
 
 export function waitNote(child: SubagentSummary | undefined, waitMs: number, timedOut: boolean): string {
@@ -320,16 +304,15 @@ function withThinking(target: SubagentTarget, thinking: string | undefined): Sub
 	return thinking ? { ...target, thinking } : target;
 }
 
+/** A saved Paseo profile selects the runtime; omitting `profile` inherits the calling agent. */
 export async function resolveSubagentTarget(params: SubagentRunParams, parentId: string, signal?: AbortSignal): Promise<SubagentTarget> {
-	if (params.provider && params.profile) fail("invalid_arguments", "pass either provider or profile, not both");
-	if (params.provider) {
-		return withThinking(splitProviderModel(params.provider), params.thinking);
-	}
-	if (params.profile) {
-		const profile = await findProfile(params.profile, parentId, signal);
+	const query = params.profile?.trim();
+	if (query) {
+		const profile = await findProfile(query, parentId, signal);
 		const target = splitProviderModel(profile.model ? `${profile.provider}/${profile.model}` : profile.provider);
 		return withThinking(target, params.thinking ?? profile.thinkingOptionId);
 	}
+	if (params.profile !== undefined) fail("invalid_arguments", "profile must not be blank; use a name or id from subagent_presets, or omit it to inherit");
 	const parent = await getAgentSnapshot(parentId, parentId, signal);
 	return withThinking(
 		{ provider: parent.provider, ...(parent.model ? { model: parent.model } : {}) },
@@ -367,19 +350,15 @@ async function readActivity(child: { subagent_id: string; archived?: boolean }, 
 	return parseActivity(await paseoMcp.callTool<unknown>("get_agent_activity", { agentId: child.subagent_id, limit: outputLines }, { callerAgentId: parentId, signal }));
 }
 
-function roleInstructions(role: SubagentRole): string {
-	return [
-		"You are a delegated Paseo subagent.",
-		`Role: ${role}.`,
-		"Work only on the assigned task in the current project.",
-		"Do not create workspaces or start unrelated agents.",
-		"Return a concise final report with findings, actions, and remaining risks.",
-		role === "scout" ? "You are read-only: do not modify files or run commands that mutate state." : "Respect the requested scope and verify claims with the available tools.",
-	].join("\n");
-}
+const SUBAGENT_INSTRUCTIONS = [
+	"You are a delegated Paseo subagent.",
+	"Work only on the assigned task in the current project.",
+	"Do not create workspaces or start unrelated agents.",
+	"Return a concise final report with findings, actions, and remaining risks.",
+].join("\n");
 
-export function buildInitialPrompt(prompt: string, role: SubagentRole): string {
-	return `${roleInstructions(role)}\n\nTask:\n${prompt}`;
+export function buildInitialPrompt(prompt: string): string {
+	return `${SUBAGENT_INSTRUCTIONS}\n\nTask:\n${prompt}`;
 }
 
 function renderSummary(result: { content: Array<{ type: string; text?: string }>; details: unknown }, theme: any): Text {
@@ -397,20 +376,18 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent_run",
 		label: "Subagent Run",
-		description: "Start a delegated Paseo subagent in the caller's workspace and return its opaque id.",
+		description: "Start a delegated Paseo subagent in the caller's workspace and return its opaque id. Omit profile to inherit this session's model; subagent_presets lists the profile names and ids.",
 		promptSnippet: "Start an asynchronous delegated subagent tracked by Paseo",
 		promptGuidelines: [
 			"The subagent is a full Paseo agent in the user's Subagents track; Paseo notifies this session when it finishes, errors, or needs permission, so do not poll for status.",
-			"For subagent_run, omit both profile and provider to inherit this session's provider, model, and thinking level; otherwise pass exactly one: profile from subagent_presets or an explicit provider or provider/model.",
-			"Never pass profile and provider together. The value `default` is not a special profile; use subagent_presets to find an actual profile name or id.",
+			"For subagent_run, omit profile to use this session's provider, model, and thinking level. To switch, copy a profile value from subagent_presets; profile is the only runtime selector.",
+			"For subagent_run, there is no role argument. State task intent such as read-only in the prompt itself; it is advisory and grants no permissions.",
 			"Subagents share the caller's working directory. Use subagent_wait to block for results and subagent_stop to interrupt or archive one.",
 		],
 		parameters: Type.Object({
 			prompt: Type.String({ minLength: 1, maxLength: MAX_PROMPT_BYTES, description: "Focused task for the delegated agent" }),
-			role: Type.Optional(Type.Union([Type.Literal("scout"), Type.Literal("reviewer"), Type.Literal("worker")], { default: "scout" })),
 			name: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_NAME_LENGTH, description: "Display name" })),
-			profile: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Paseo agent profile name or id; mutually exclusive with provider" })),
-			provider: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Explicit Paseo provider or provider/model; mutually exclusive with profile" })),
+			profile: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Saved Paseo agent profile name or id from subagent_presets. Omit to inherit this session's provider, model, and thinking level." })),
 			thinking: Type.Optional(Type.String({ minLength: 1, maxLength: 64, description: "Thinking level override, for example xhigh. Paseo ids are provider-specific; omit to use the profile's or the parent's level." })),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: SubagentRunParams, signal, _onUpdate, ctx) {
@@ -420,7 +397,6 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 			if (params.name !== undefined && (params.name.length > MAX_NAME_LENGTH || /[\r\n]/.test(params.name))) {
 				fail("invalid_arguments", `name must be at most ${MAX_NAME_LENGTH} characters and contain no line breaks`);
 			}
-			const role = params.role ?? "scout";
 			const parentId = parentAgentId();
 			const target = await resolveSubagentTarget(params, parentId, signal);
 			const children = await listChildren(parentId, true, signal);
@@ -428,17 +404,16 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 				fail("too_many_active_subagents", `${MAX_ACTIVE_SUBAGENTS} subagents are still active`);
 			}
 			const created = parseCreateAgent(await paseoMcp.callTool<unknown>("create_agent", {
-				title: subagentTitle(role, params.name),
+				title: titleName(params.name),
 				provider: providerSelector(target.provider, target.model),
 				labels: { [SESSION_LABEL_KEY]: sessionKey(ctx) },
 				...(target.thinking ? { settings: { thinkingOptionId: target.thinking } } : {}),
-				initialPrompt: buildInitialPrompt(params.prompt, role),
+				initialPrompt: buildInitialPrompt(params.prompt),
 				notifyOnFinish: true,
 			}, { callerAgentId: parentId, signal }));
 			const summary: SubagentSummary = {
 				subagent_id: created.agentId,
 				name: params.name?.trim() || "task",
-				role,
 				status: "running",
 				provider: providerSelector(target.provider, target.model),
 			};
@@ -580,7 +555,7 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent_presets",
 		label: "Subagent Presets",
-		description: "List the Paseo agent profiles available as subagent presets, including their notes.",
+		description: "List Paseo agent profiles with ready-to-use profile values for subagent_run and selection notes.",
 		parameters: Type.Object({}, { additionalProperties: false }),
 		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
 			trusted(ctx);
@@ -588,10 +563,11 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 			const text = profiles.length
 				? profiles.map((profile) => [
 					`${profile.name} (${profile.id})`,
+					`  ${JSON.stringify({ profile: profile.id })}`,
 					`  ${providerSelector(profile.provider, profile.model)}${profile.thinkingOptionId ? ` thinking=${profile.thinkingOptionId}` : ""}${profile.modeId ? ` mode=${profile.modeId}` : ""}`,
 					...(profile.notes ? [`  notes: ${profile.notes}`] : []),
 				].join("\n")).join("\n")
-				: "No agent profiles are configured in Paseo.";
+				: "No agent profiles are configured in Paseo. Omit profile to keep this session's model.";
 			return { content: [{ type: "text", text }], details: { profiles } };
 		},
 		renderResult(result, _options, theme) {
@@ -613,7 +589,7 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 				}
 				if (action === "presets") {
 					const profiles = parseProfiles(await paseoMcp.callTool<unknown>("list_profiles", {}, { callerAgentId: parentId }));
-					ctx.ui.notify(profiles.length ? profiles.map((profile) => `${profile.name} -> ${providerSelector(profile.provider, profile.model)}`).join("\n") : "No agent profiles are configured in Paseo.", "info");
+					ctx.ui.notify(profiles.length ? profiles.map((profile) => `${profile.name} -> ${providerSelector(profile.provider, profile.model)} ${JSON.stringify({ profile: profile.id })}`).join("\n") : "No agent profiles are configured in Paseo.", "info");
 					return;
 				}
 				if (id && (action === "read" || action === "interrupt" || action === "terminate")) {

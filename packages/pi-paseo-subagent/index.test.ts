@@ -3,17 +3,17 @@ import assert from "node:assert/strict";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Check } from "typebox/value";
 
 import piPaseoSubagentExtension, {
 	buildInitialPrompt,
 	parseChildren,
 	parseProfiles,
-	parseSubagentTitle,
 	providerSelector,
 	sessionKey,
 	splitProviderModel,
 	subagentTiming,
-	subagentTitle,
+	titleName,
 	waitNote,
 } from "./index.ts";
 import {
@@ -51,7 +51,7 @@ function childSnapshot(overrides: Record<string, unknown> = {}) {
 		model: "h/deepseek-flash",
 		effectiveThinkingOptionId: "minimal",
 		status: "idle",
-		title: "scout: auth-review",
+		title: "auth-review",
 		labels: { "paseo.parent-agent-id": PARENT_ID, "pi-paseo-subagent": "session-1" },
 		requiresAttention: true,
 		attentionReason: "finished",
@@ -63,7 +63,7 @@ function childRow(overrides: Record<string, unknown> = {}) {
 	return {
 		id: CHILD_ID,
 		shortId: "1f75174",
-		title: "scout: auth-review",
+		title: "auth-review",
 		provider: "pi",
 		model: "h/deepseek-flash",
 		status: "idle",
@@ -113,8 +113,8 @@ function makeDaemon(overrides: { respond?: (call: RecordedCall, daemon: FakeDaem
 		state: {
 			children: [
 				childRow(),
-				childRow({ id: OTHER_CHILD_ID, title: "worker: parser", status: "running", requiresAttention: false, attentionReason: null }),
-				childRow({ id: FOREIGN_ID, title: "scout: someone else", labels: { "paseo.parent-agent-id": "another-parent" } }),
+				childRow({ id: OTHER_CHILD_ID, title: "parser audit", status: "running", requiresAttention: false, attentionReason: null }),
+				childRow({ id: FOREIGN_ID, title: "someone else", labels: { "paseo.parent-agent-id": "another-parent" } }),
 			],
 			activity: "Showing all 2 activities\n\n[User] review the diff\ntwo real bugs found",
 		},
@@ -130,7 +130,7 @@ function makeDaemon(overrides: { respond?: (call: RecordedCall, daemon: FakeDaem
 				const agentId = call.args.agentId;
 				if (agentId === PARENT_ID) return ok({ status: "running", snapshot: PARENT_SNAPSHOT });
 				if (agentId === CHILD_ID) return ok({ status: "idle", snapshot: childSnapshot() });
-				if (agentId === OTHER_CHILD_ID) return ok({ status: "running", snapshot: childSnapshot({ id: OTHER_CHILD_ID, title: "worker: parser", status: "running", requiresAttention: false, attentionReason: undefined }) });
+				if (agentId === OTHER_CHILD_ID) return ok({ status: "running", snapshot: childSnapshot({ id: OTHER_CHILD_ID, title: "parser audit", status: "running", requiresAttention: false, attentionReason: undefined }) });
 				return toolError(`Agent ${String(agentId)} not found`);
 			}
 			case "list_agents":
@@ -216,7 +216,6 @@ interface RegisteredTool {
 	name: string;
 	execute?: (...args: unknown[]) => Promise<unknown>;
 	parameters?: { properties?: Record<string, unknown> };
-	promptGuidelines?: string[];
 }
 
 function registeredTools(): RegisteredTool[] {
@@ -366,11 +365,11 @@ test("splits provider/model ids and rejects empty models", () => {
 	assert.equal(providerSelector("pi", "h/deepseek-flash"), "pi/h/deepseek-flash");
 });
 
-test("round-trips the role and name encoded in the agent title", () => {
-	assert.equal(subagentTitle("reviewer", "diff pass"), "reviewer: diff pass");
-	assert.equal(subagentTitle("scout"), "scout: task");
-	assert.deepEqual(parseSubagentTitle("scout: fix: the parser"), { role: "scout", name: "fix: the parser" });
-	assert.deepEqual(parseSubagentTitle("hand-written agent"), { name: "hand-written agent" });
+test("treats the agent title as the subagent name", () => {
+	assert.equal(titleName("hand-written agent"), "hand-written agent");
+	assert.equal(titleName("  padded name  "), "padded name");
+	assert.equal(titleName(""), "task");
+	assert.equal(titleName(undefined), "task");
 });
 
 test("derives a stable session key", () => {
@@ -378,11 +377,11 @@ test("derives a stable session key", () => {
 	assert.equal(sessionKey(fakeContext({ sessionManager: { getSessionId: () => undefined, getSessionFile: () => "/tmp/sessions/a.jsonl" } })), "-tmp-sessions-a.jsonl");
 });
 
-test("carries the delegated role into the child prompt", () => {
-	const prompt = buildInitialPrompt("Inspect the parser", "scout");
-	assert.ok(prompt.includes("Role: scout."));
-	assert.ok(prompt.includes("read-only"));
-	assert.ok(prompt.includes("Task:\nInspect the parser"));
+test("frames the child prompt with delegation instructions instead of a role", () => {
+	const prompt = buildInitialPrompt("Read-only: inspect the parser");
+	assert.ok(prompt.includes("You are a delegated Paseo subagent."));
+	assert.ok(prompt.includes("Task:\nRead-only: inspect the parser"));
+	assert.ok(!prompt.includes("Role:"));
 });
 
 test("maps paseo profiles and child rows", () => {
@@ -396,7 +395,6 @@ test("maps paseo profiles and child rows", () => {
 	assert.deepEqual(children[0], {
 		subagent_id: CHILD_ID,
 		name: "auth-review",
-		role: "scout",
 		status: "idle",
 		provider: "pi/h/deepseek-flash",
 		model: "h/deepseek-flash",
@@ -426,18 +424,20 @@ test("registers the six subagent tools", () => {
 	]);
 	const runParams = tools.find((entry) => entry.name === "subagent_run")?.parameters?.properties;
 	assert.ok(runParams && "profile" in runParams && "thinking" in runParams);
-	assert.ok(runParams && !("cwd" in runParams) && !("model_preset" in runParams));
+	assert.ok(runParams && !("role" in runParams) && !("cwd" in runParams) && !("model_preset" in runParams));
 	const runTool = tools.find((entry) => entry.name === "subagent_run");
-	assert.match(runTool?.promptGuidelines?.join(" ") ?? "", /omit both profile and provider/);
-	assert.match(runTool?.promptGuidelines?.join(" ") ?? "", /Never pass profile and provider together/);
-	assert.match(JSON.stringify(runParams?.profile), /mutually exclusive with provider/);
-	assert.match(JSON.stringify(runParams?.provider), /mutually exclusive with profile/);
+	assert.ok(runParams && !("target" in runParams) && !("provider" in runParams));
+	assert.ok(Check(runTool!.parameters!, { prompt: "task" }));
+	assert.ok(Check(runTool!.parameters!, { prompt: "task", profile: "Reviewer" }));
+	for (const legacy of [{ target: "inherit" }, { provider: "openai" }, { role: "scout" }, { profile: "Reviewer", provider: "pi" }]) {
+		assert.equal(Check(runTool!.parameters!, { prompt: "task", ...legacy }), false);
+	}
 });
 
 test("inherits provider, model, and thinking from the calling agent", async () => {
 	const daemon = makeDaemon();
 	await withFakeDaemon(daemon, async () => {
-		const result = await tool(registeredTools(), "subagent_run")("call", { prompt: "review the diff", role: "reviewer", name: "diff pass" }, undefined, undefined, fakeContext()) as {
+		const result = await tool(registeredTools(), "subagent_run")("call", { prompt: "review the diff", name: "diff pass" }, undefined, undefined, fakeContext()) as {
 			content: Array<{ text: string }>;
 			details: { subagent_id: string; guidance?: string };
 		};
@@ -447,42 +447,75 @@ test("inherits provider, model, and thinking from the calling agent", async () =
 		assert.deepEqual(toolNames(daemon.calls).slice(0, 3), ["get_agent_status", "list_agents", "create_agent"]);
 		const created = daemon.calls[2];
 		assert.deepEqual(created?.args, {
-			title: "reviewer: diff pass",
+			title: "diff pass",
 			provider: "pi/h/deepseek-flash",
 			labels: { "pi-paseo-subagent": "session-1" },
 			settings: { thinkingOptionId: "xhigh" },
-			initialPrompt: buildInitialPrompt("review the diff", "reviewer"),
+			initialPrompt: buildInitialPrompt("review the diff"),
 			notifyOnFinish: true,
 		});
 		assert.equal(created?.callerAgentId, PARENT_ID);
 	});
 });
 
-test("uses a paseo profile without inspecting the parent", async () => {
+test("omitting profile keeps the parent model and allows a thinking override", async () => {
 	const daemon = makeDaemon();
 	await withFakeDaemon(daemon, async () => {
-		await tool(registeredTools(), "subagent_run")("call", { prompt: "task", profile: "reviewer" }, undefined, undefined, fakeContext());
+		await tool(registeredTools(), "subagent_run")("call", { prompt: "task", name: "inherit check", thinking: "high" }, undefined, undefined, fakeContext());
+		assert.deepEqual(toolNames(daemon.calls), ["get_agent_status", "list_agents", "create_agent"]);
+		assert.equal(daemon.calls[2]?.args.provider, "pi/h/deepseek-flash");
+		assert.deepEqual(daemon.calls[2]?.args.settings, { thinkingOptionId: "high" });
+	});
+});
+
+test("uses a profile by name or id without inspecting the parent", async () => {
+	const daemon = makeDaemon();
+	await withFakeDaemon(daemon, async () => {
+		const run = tool(registeredTools(), "subagent_run");
+		await run("call", { prompt: "task", profile: "reviewer" }, undefined, undefined, fakeContext());
 		assert.deepEqual(toolNames(daemon.calls), ["list_profiles", "list_agents", "create_agent"]);
+		assert.equal(daemon.calls[2]?.args.provider, "pi/nikoapi/gpt-5.6-sol");
+		assert.deepEqual(daemon.calls[2]?.args.settings, { thinkingOptionId: "high" });
+		await run("call", { prompt: "task", profile: "agent_profile_review", thinking: "low" }, undefined, undefined, fakeContext());
+		assert.equal(daemon.calls[5]?.args.provider, "pi/nikoapi/gpt-5.6-sol");
+		assert.deepEqual(daemon.calls[5]?.args.settings, { thinkingOptionId: "low" });
+	});
+});
+
+test("lets an explicit thinking override win over the profile level", async () => {
+	const daemon = makeDaemon();
+	await withFakeDaemon(daemon, async () => {
+		const run = tool(registeredTools(), "subagent_run");
+		await run("call", { prompt: "task", profile: "Fast Flash", thinking: "low" }, undefined, undefined, fakeContext());
+		assert.deepEqual(toolNames(daemon.calls), ["list_profiles", "list_agents", "create_agent"]);
+		assert.equal(daemon.calls[2]?.args.provider, "pi/h/deepseek-flash");
+		assert.deepEqual(daemon.calls[2]?.args.settings, { thinkingOptionId: "low" });
+		await run("call", { prompt: "task", profile: "Fast Flash" }, undefined, undefined, fakeContext());
+		assert.deepEqual(daemon.calls[5]?.args.settings, { thinkingOptionId: "low" });
+	});
+});
+
+test("keeps the profile's own thinking level and provider without an override", async () => {
+	const daemon = makeDaemon();
+	await withFakeDaemon(daemon, async () => {
+		await tool(registeredTools(), "subagent_run")("call", { prompt: "task", profile: "Reviewer" }, undefined, undefined, fakeContext());
 		assert.equal(daemon.calls[2]?.args.provider, "pi/nikoapi/gpt-5.6-sol");
 		assert.deepEqual(daemon.calls[2]?.args.settings, { thinkingOptionId: "high" });
 	});
 });
 
-test("lets an explicit provider and thinking override win", async () => {
-	const daemon = makeDaemon();
-	await withFakeDaemon(daemon, async () => {
-		await tool(registeredTools(), "subagent_run")("call", { prompt: "task", provider: "opencode", thinking: "low" }, undefined, undefined, fakeContext());
-		assert.equal(daemon.calls[1]?.args.provider, "opencode");
-		assert.deepEqual(daemon.calls[1]?.args.settings, { thinkingOptionId: "low" });
-	});
-});
-
-test("rejects ambiguous or unknown profile selections", async () => {
+test("rejects malformed profiles locally and never falls back for unknown ones", async () => {
 	const daemon = makeDaemon();
 	await withFakeDaemon(daemon, async () => {
 		const run = tool(registeredTools(), "subagent_run");
-		await assert.rejects(() => run("call", { prompt: "task", profile: "Reviewer", provider: "pi" }, undefined, undefined, fakeContext()), /invalid_arguments: pass either provider or profile/);
-		await assert.rejects(() => run("call", { prompt: "task", profile: "nope" }, undefined, undefined, fakeContext()), /profile_not_found: nope/);
+		for (const profile of ["", " ", "   "]) {
+			await assert.rejects(() => run("call", { prompt: "task", profile }, undefined, undefined, fakeContext()), /invalid_arguments: profile must not be blank/);
+		}
+		assert.deepEqual(daemon.calls, []);
+		for (const profile of ["scout", "default", "openai", "inherit", "provider:codex"]) {
+			await assert.rejects(() => run("call", { prompt: "task", profile }, undefined, undefined, fakeContext()), /profile_not_found/);
+		}
+		assert.deepEqual(toolNames(daemon.calls).filter((name) => name !== "list_profiles"), []);
 	});
 });
 
@@ -525,7 +558,7 @@ test("lists only this session's children, with attention flags", async () => {
 			details: { summaries: Array<{ subagent_id: string }> };
 		};
 		assert.deepEqual(result.details.summaries.map((entry) => entry.subagent_id), [CHILD_ID, OTHER_CHILD_ID]);
-		assert.match(result.content[0]?.text ?? "", new RegExp(`${CHILD_ID} \\[idle\\] scout auth-review attention=finished`));
+		assert.match(result.content[0]?.text ?? "", new RegExp(`${CHILD_ID} \\[idle\\] auth-review attention=finished`));
 		assert.equal(daemon.calls[0]?.args.includeArchived, false);
 		assert.equal(daemon.calls[0]?.args.sinceHours, 720);
 
@@ -562,7 +595,7 @@ test("does not resume an archived child when reading it", async () => {
 		// `get_agent_activity` would resume the agent on the daemon and clear its `archivedAt`.
 		assert.deepEqual(daemon.calls.map((call) => call.name), ["get_agent_status"]);
 		assert.equal(result.details.summary.archived, true);
-		assert.match(result.content[0]?.text ?? "", new RegExp(`${CHILD_ID} \\[closed\\] scout auth-review attention=finished archived`));
+		assert.match(result.content[0]?.text ?? "", new RegExp(`${CHILD_ID} \\[closed\\] auth-review attention=finished archived`));
 		assert.match(result.content[0]?.text ?? "", /archived: this subagent was removed from the track/);
 	});
 });
@@ -599,7 +632,7 @@ test("reads no transcript for an archived child during a wait", async () => {
 	const daemon = makeDaemon();
 	daemon.state.children = [
 		childRow({ status: "closed", archivedAt: "2026-09-13T04:13:12.000Z" }),
-		childRow({ id: OTHER_CHILD_ID, title: "worker: parser", status: "running", requiresAttention: false, attentionReason: null }),
+		childRow({ id: OTHER_CHILD_ID, title: "parser audit", status: "running", requiresAttention: false, attentionReason: null }),
 	];
 	await withFakeDaemon(daemon, async () => {
 		const result = await tool(registeredTools(), "subagent_wait")("call", { subagent_ids: [CHILD_ID, OTHER_CHILD_ID], wait_ms: 200 }, undefined, undefined, fakeContext()) as { content: Array<{ text: string }> };
@@ -612,7 +645,7 @@ test("reads no transcript for an archived child during a wait", async () => {
 
 test("returns as soon as any child settles in any mode", async () => {
 	const daemon = makeDaemon();
-	const runningChild = childRow({ id: OTHER_CHILD_ID, title: "worker: parser", status: "running", requiresAttention: false, attentionReason: null });
+	const runningChild = childRow({ id: OTHER_CHILD_ID, title: "parser audit", status: "running", requiresAttention: false, attentionReason: null });
 	daemon.state.children = [
 		childRow({ id: CHILD_ID, status: "running", requiresAttention: false, attentionReason: null }),
 		runningChild,
@@ -622,7 +655,7 @@ test("returns as soon as any child settles in any mode", async () => {
 		await assert.rejects(() => wait("call", { subagent_ids: [CHILD_ID, CHILD_ID], wait_ms: 100 }, undefined, undefined, fakeContext()), /invalid_arguments: subagent_ids must not contain duplicates/);
 
 		// The second child is still running, but `any` should not wait for the first one to settle twice.
-		daemon.state.children[1] = childRow({ id: OTHER_CHILD_ID, title: "worker: parser", status: "idle", requiresAttention: false, attentionReason: null });
+		daemon.state.children[1] = childRow({ id: OTHER_CHILD_ID, title: "parser audit", status: "idle", requiresAttention: false, attentionReason: null });
 		const settled = await wait("call", { subagent_ids: [CHILD_ID, OTHER_CHILD_ID], mode: "any", wait_ms: 1_000 }, undefined, undefined, fakeContext()) as {
 			details: { timed_out: boolean };
 		};
@@ -655,11 +688,16 @@ test("lists paseo profiles as presets", async () => {
 	await withFakeDaemon(daemon, async () => {
 		const result = await tool(registeredTools(), "subagent_presets")("call", {}, undefined, undefined, fakeContext()) as {
 			content: Array<{ text: string }>;
-			details: { profiles: unknown[] };
+			details: { profiles: Array<{ id: string }> };
 		};
 		assert.equal(result.details.profiles.length, 2);
 		assert.match(result.content[0]?.text ?? "", /Reviewer \(agent_profile_review\)/);
 		assert.match(result.content[0]?.text ?? "", /notes: Use for independent review\./);
+		const profile = result.details.profiles[1]!.id;
+		assert.equal(profile, "agent_profile_review");
+		assert.ok(result.content[0]?.text.includes(JSON.stringify({ profile })));
+		await tool(registeredTools(), "subagent_run")("call", { prompt: "task", profile }, undefined, undefined, fakeContext());
+		assert.equal(daemon.calls.at(-1)?.args.provider, "pi/nikoapi/gpt-5.6-sol");
 	});
 });
 
