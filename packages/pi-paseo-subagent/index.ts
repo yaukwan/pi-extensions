@@ -8,6 +8,7 @@ import { paseoMcp } from "./mcp-client.ts";
 
 const MAX_PROMPT_BYTES = 32 * 1024;
 const MAX_NAME_LENGTH = 40;
+const MAX_ANSWER_LENGTH = 512;
 const MAX_ACTIVE_SUBAGENTS = 8;
 const MAX_WAIT_MS = 300_000;
 const DEFAULT_WAIT_MS = 300_000;
@@ -21,6 +22,8 @@ const PARENT_AGENT_ID_LABEL = "paseo.parent-agent-id";
 const ACTIVE_STATUSES = ["initializing", "running"];
 const ARCHIVED_TRANSCRIPT_NOTE =
 	"archived: this subagent was removed from the track, and reading it here would resume it on the daemon (re-adding it to the list and re-firing its finish notification). Inspect it in Paseo instead.";
+const WAIT_SUMMARY_NOTE =
+	"\n\nactivity omitted: Paseo's finish notification delivers each child's final message. Pass include_activity to fetch transcripts here.";
 
 /** Overridable so tests do not have to wait out a real poll interval. */
 export const subagentTiming = { pollIntervalMs: 500 };
@@ -46,12 +49,27 @@ export interface SubagentWaitParams {
 	subagent_ids: string[];
 	mode?: "all" | "any";
 	wait_ms?: number;
+	include_activity?: boolean;
 	output_lines?: number;
 }
 
 export interface SubagentStopParams {
 	subagent_id: string;
 	mode: "interrupt" | "terminate";
+}
+
+export interface SubagentSendParams {
+	subagent_id: string;
+	prompt: string;
+}
+
+export interface SubagentPermitParams {
+	subagent_id?: string;
+	request_id?: string;
+	decision?: "allow" | "deny";
+	answer?: string;
+	comment?: string;
+	action_id?: string;
 }
 
 export interface AgentProfile {
@@ -94,6 +112,8 @@ interface SubagentTarget {
 	model?: string;
 	/** Passed to Paseo as `settings.thinkingOptionId`; ids are provider-specific, so they are not validated here. */
 	thinking?: string;
+	/** Passed to Paseo as `settings.modeId`. Required for a cross-provider child: the daemon refuses to inherit a mode across providers. */
+	mode?: string;
 }
 
 function fail(code: string, detail: string): never {
@@ -258,7 +278,7 @@ function summaryText(child: SubagentSummary): string {
 
 export function waitNote(child: SubagentSummary | undefined, waitMs: number, timedOut: boolean): string {
 	if (child?.attentionReason === "permission") {
-		return "\n\nwaiting for permission approval: approve it in Paseo, or run `paseo permit allow <id>`.";
+		return "\n\nblocked on a permission request that never times out: list it with `subagent_permit` and answer allow or deny, approve it in Paseo, or run `paseo permit allow <id>`. Until it is answered the subagent stays running and keeps one concurrency slot.";
 	}
 	if (timedOut && child && isActive(child)) return `\n\nstill running after ${waitMs}ms.`;
 	return "";
@@ -274,12 +294,40 @@ async function getAgentSnapshot(agentId: string, parentId: string, signal?: Abor
 	}
 }
 
-async function requireOwnedChild(agentId: string, parentId: string, signal?: AbortSignal): Promise<AgentSnapshot> {
-	const snapshot = await getAgentSnapshot(agentId, parentId, signal);
-	if (snapshot.parentAgentId !== parentId) {
-		fail("subagent_not_found", `${agentId} is not a subagent of this session`);
+/**
+ * Resolves an id, or a display name unique among this session's children, and enforces ownership.
+ *
+ * The id path costs a single `get_agent_status`; a name only falls back to `list_agents` when the
+ * reference is not a known agent id.
+ */
+async function requireOwnedChild(reference: string, parentId: string, signal?: AbortSignal): Promise<AgentSnapshot> {
+	const trimmed = reference.trim();
+	const direct = await findOwnedSnapshot(trimmed, parentId, signal);
+	if (direct === "not-owned") fail("subagent_not_found", `${trimmed} is not a subagent of this session`);
+	if (direct) return direct;
+
+	const children = await listChildren(parentId, true, signal);
+	const matches = children.filter((child) => child.name.toLowerCase() === trimmed.toLowerCase());
+	if (matches.length > 1) {
+		fail("ambiguous_subagent_name", `"${trimmed}" matches ${matches.length} subagents: ${matches.map((child) => `${child.subagent_id} [${child.status}]`).join(", ")}`);
 	}
-	return snapshot;
+	const match = matches[0];
+	if (!match) fail("subagent_not_found", `${reference} does not exist on this Paseo daemon`);
+	const named = await findOwnedSnapshot(match.subagent_id, parentId, signal);
+	if (!named || named === "not-owned") fail("subagent_not_found", `${reference} is not a subagent of this session`);
+	return named;
+}
+
+/** Returns the snapshot, `not-owned` when it belongs to another parent, or `null` when unknown. */
+async function findOwnedSnapshot(agentId: string, parentId: string, signal?: AbortSignal): Promise<AgentSnapshot | "not-owned" | null> {
+	try {
+		const snapshot = await getAgentSnapshot(agentId, parentId, signal);
+		return snapshot.parentAgentId === parentId ? snapshot : "not-owned";
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (message.startsWith("subagent_not_found")) return null;
+		throw error;
+	}
 }
 
 async function listChildren(parentId: string, includeFinished: boolean, signal?: AbortSignal): Promise<SubagentSummary[]> {
@@ -310,7 +358,7 @@ export async function resolveSubagentTarget(params: SubagentRunParams, parentId:
 	if (query) {
 		const profile = await findProfile(query, parentId, signal);
 		const target = splitProviderModel(profile.model ? `${profile.provider}/${profile.model}` : profile.provider);
-		return withThinking(target, params.thinking ?? profile.thinkingOptionId);
+		return { ...withThinking(target, params.thinking ?? profile.thinkingOptionId), ...(profile.modeId ? { mode: profile.modeId } : {}) };
 	}
 	if (params.profile !== undefined) fail("invalid_arguments", "profile must not be blank; use a name or id from subagent_presets, or omit it to inherit");
 	const parent = await getAgentSnapshot(parentId, parentId, signal);
@@ -329,6 +377,9 @@ async function pollChildren(ids: string[], mode: "all" | "any", waitMs: number, 
 	const wanted = new Set(ids);
 	const deadline = Date.now() + waitMs;
 	let children = new Map<string, SubagentSummary>();
+	// Back off from the base interval instead of hammering `list_agents`: the finish notification
+	// already delivers settled children, so this loop is only a fallback.
+	let attempt = 0;
 	for (;;) {
 		children = new Map((await listChildren(parentId, true, signal)).filter((child) => wanted.has(child.subagent_id)).map((child) => [child.subagent_id, child]));
 		const settled = ids.filter((id) => {
@@ -338,7 +389,7 @@ async function pollChildren(ids: string[], mode: "all" | "any", waitMs: number, 
 		if (mode === "any" ? settled.length > 0 : settled.length === ids.length) return { children, timedOut: false };
 		const remaining = deadline - Date.now();
 		if (remaining <= 0) return { children, timedOut: true };
-		await delay(Math.min(subagentTiming.pollIntervalMs, remaining));
+		await delay(Math.min(subagentTiming.pollIntervalMs * 2 ** Math.min(attempt++, 3), remaining));
 		if (signal?.aborted) fail("cancelled", "the wait was cancelled");
 	}
 }
@@ -354,11 +405,70 @@ const SUBAGENT_INSTRUCTIONS = [
 	"You are a delegated Paseo subagent.",
 	"Work only on the assigned task in the current project.",
 	"Do not create workspaces or start unrelated agents.",
-	"Return a concise final report with findings, actions, and remaining risks.",
+	"Other agents, including your parent, work in this same directory. Do not revert, overwrite, or reformat edits outside your assigned scope.",
+	"You have no interactive user. Do not ask questions; make reasonable assumptions and state them in the final report.",
+	"Your final message is delivered verbatim to the parent agent and truncated to about 4000 characters, so lead with the conclusion, then what you did, then the file paths you changed, then remaining risks.",
+	"Do not rely on the parent reading your transcript. Make the final report self-contained.",
 ].join("\n");
 
 export function buildInitialPrompt(prompt: string): string {
 	return `${SUBAGENT_INSTRUCTIONS}\n\nTask:\n${prompt}`;
+}
+
+/**
+ * Builds the `respond_to_permission` payload.
+ *
+ * A `question` permission (Pi `ask_user`, select, or confirm dialogs) needs the answer inside
+ * `updatedInput.answers` under the provider's headers — a bare `allow` is read as a cancellation.
+ */
+export function permitResponse(params: { decision: "allow" | "deny"; answer?: string; comment?: string; action_id?: string }): Record<string, unknown> {
+	const action = params.action_id ? { selectedActionId: params.action_id } : {};
+	if (params.decision === "deny") {
+		return { behavior: "deny", ...action, ...(params.comment ? { message: params.comment } : {}) };
+	}
+	return {
+		behavior: "allow",
+		...action,
+		...(params.answer ? { updatedInput: { answers: { [QUESTION_RESPONSE_HEADER]: params.answer, ...(params.comment ? { [QUESTION_COMMENT_HEADER]: params.comment } : {}) } } } : {}),
+	};
+}
+
+const QUESTION_RESPONSE_HEADER = "Response";
+const QUESTION_COMMENT_HEADER = "Comment";
+
+function permissionQuestion(request: Record<string, unknown>): { question: string; options: string[] } | undefined {
+	const questions = isRecord(request.input) ? request.input.questions : undefined;
+	if (!Array.isArray(questions) || !questions.length) return undefined;
+	const first = questions[0];
+	if (!isRecord(first)) return undefined;
+	const options = Array.isArray(first.options) ? first.options.filter(isRecord).map((option) => asString(option.label) ?? "").filter(Boolean) : [];
+	return { question: asString(first.question) ?? "", options };
+}
+
+function formatPendingPermission(entry: Record<string, unknown>): string {
+	const request = isRecord(entry.request) ? entry.request : {};
+	const head = `${asString(entry.agentId) ?? "?"} request=${asString(request.id) ?? "?"} kind=${asString(request.kind) ?? "?"}`;
+	const title = asString(request.title) ?? asString(request.name) ?? "";
+	const description = asString(request.description);
+	const question = permissionQuestion(request);
+	const actions = Array.isArray(request.actions)
+		? request.actions.filter(isRecord).map((action) => `${asString(action.id) ?? "?"}=${asString(action.label) ?? ""}(${asString(action.behavior) ?? ""})`).join(", ")
+		: "";
+	const details = [
+		...(title ? [`  ${title}`] : []),
+		...(description ? [`  ${description}`] : []),
+		...(question?.question ? [`  question: ${question.question}${question.options.length ? `\n  options: ${question.options.join(" | ")}` : ""}`] : []),
+		...(actions ? [`  actions: ${actions}`] : []),
+		`  answer with: subagent_permit {subagent_id: "${asString(entry.agentId) ?? ""}", request_id: "${asString(request.id) ?? ""}", decision: "allow"${question ? `, answer: "<choice or free text>"` : ""}}`,
+	];
+	return [head, ...details].join("\n");
+}
+
+export function parsePendingPermissions(value: unknown, ownedIds: Set<string>): Record<string, unknown>[] {
+	const permissions = isRecord(value) ? value.permissions : undefined;
+	if (!Array.isArray(permissions)) fail("paseo_invalid_output", "list_pending_permissions returned no permissions");
+	// The daemon returns pending requests across every agent on the host, so ownership is filtered here.
+	return permissions.filter(isRecord).filter((entry) => ownedIds.has(asString(entry.agentId) ?? ""));
 }
 
 function renderSummary(result: { content: Array<{ type: string; text?: string }>; details: unknown }, theme: any): Text {
@@ -380,9 +490,13 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 		promptSnippet: "Start an asynchronous delegated subagent tracked by Paseo",
 		promptGuidelines: [
 			"The subagent is a full Paseo agent in the user's Subagents track; Paseo notifies this session when it finishes, errors, or needs permission, so do not poll for status.",
+			"Delegate only bounded, self-contained sidecar tasks that can run while you keep working locally. Do the critical-path step your next action depends on yourself instead of waiting on a subagent.",
+			"A subagent sees only the prompt you give it, never your conversation history. Make every prompt self-contained: goal, relevant file paths, constraints, acceptance criteria, and the files it may edit.",
+			"Spawn several independent subagents in the same turn instead of one at a time, and give editing tasks disjoint file scopes. Subagents share this working directory and see each other's edits.",
+			`At most ${MAX_ACTIVE_SUBAGENTS} subagents can be active at once. After delegating, do non-overlapping work; do not redo or re-delegate a subagent's task while it runs.`,
+			"Use subagent_send to add follow-up work to an existing subagent instead of spawning a new one when the task depends on the child's accumulated context.",
 			"For subagent_run, omit profile to use this session's provider, model, and thinking level. To switch, copy a profile value from subagent_presets; profile is the only runtime selector.",
 			"For subagent_run, there is no role argument. State task intent such as read-only in the prompt itself; it is advisory and grants no permissions.",
-			"Subagents share the caller's working directory. Use subagent_wait to block for results and subagent_stop to interrupt or archive one.",
 		],
 		parameters: Type.Object({
 			prompt: Type.String({ minLength: 1, maxLength: MAX_PROMPT_BYTES, description: "Focused task for the delegated agent" }),
@@ -400,14 +514,17 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 			const parentId = parentAgentId();
 			const target = await resolveSubagentTarget(params, parentId, signal);
 			const children = await listChildren(parentId, true, signal);
-			if (children.filter(isActive).length >= MAX_ACTIVE_SUBAGENTS) {
-				fail("too_many_active_subagents", `${MAX_ACTIVE_SUBAGENTS} subagents are still active`);
+			const active = children.filter(isActive);
+			if (active.length >= MAX_ACTIVE_SUBAGENTS) {
+				fail("too_many_active_subagents", `${MAX_ACTIVE_SUBAGENTS} subagents are still active:\n${active.map(summaryText).join("\n")}\nStop one with subagent_stop, or wait for it to settle.`);
 			}
 			const created = parseCreateAgent(await paseoMcp.callTool<unknown>("create_agent", {
 				title: titleName(params.name),
 				provider: providerSelector(target.provider, target.model),
 				labels: { [SESSION_LABEL_KEY]: sessionKey(ctx) },
-				...(target.thinking ? { settings: { thinkingOptionId: target.thinking } } : {}),
+				...((target.thinking || target.mode)
+					? { settings: { ...(target.thinking ? { thinkingOptionId: target.thinking } : {}), ...(target.mode ? { modeId: target.mode } : {}) } }
+					: {}),
 				initialPrompt: buildInitialPrompt(params.prompt),
 				notifyOnFinish: true,
 			}, { callerAgentId: parentId, signal }));
@@ -446,10 +563,10 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent_read",
 		label: "Subagent Read",
-		description: "Read a delegated Paseo subagent's activity, optionally waiting for it to settle first.",
+		description: "Read a delegated Paseo subagent's activity, optionally waiting for it to settle first. An archived subagent returns a status line instead of its transcript.",
 		parameters: Type.Object({
-			subagent_id: Type.String({ minLength: 1, maxLength: 128 }),
-			wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS })),
+			subagent_id: Type.String({ minLength: 1, maxLength: 128, description: "Subagent id or display name" }),
+			wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `Milliseconds to wait for the subagent to settle first. Defaults to 0, which returns the current state without waiting. Maximum ${MAX_WAIT_MS}.` })),
 			output_lines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_OUTPUT_LINES })),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: SubagentReadParams, signal, _onUpdate, ctx) {
@@ -477,20 +594,22 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent_wait",
 		label: "Subagent Wait",
-		description: "Wait for one or more Paseo subagents to settle, then return their state and activity.",
+		description: "Wait for one or more Paseo subagents to settle, then return their state and attention flags. Settled content arrives through Paseo's finish notification, so transcripts are not fetched unless include_activity is set. A subagent blocked on a permission request settles immediately with a note.",
 		parameters: Type.Object({
 			subagent_ids: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_ACTIVE_SUBAGENTS }),
 			mode: Type.Optional(Type.Union([Type.Literal("all"), Type.Literal("any")], { default: "all" })),
-			wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: "Shared timeout for the wait operation" })),
-			output_lines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_OUTPUT_LINES })),
+			wait_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: `Shared timeout in milliseconds, default ${DEFAULT_WAIT_MS}. 0 returns the current state without waiting.` })),
+			include_activity: Type.Optional(Type.Boolean({ description: "Also fetch each subagent's curated activity. Omit to return state only: the finish notification already delivers the child's final message." })),
+			output_lines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_OUTPUT_LINES, description: "Activity entries per subagent when include_activity is set." })),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: SubagentWaitParams, signal, _onUpdate, ctx) {
 			trusted(ctx);
 			const parentId = parentAgentId();
 			const ids = [...new Set(params.subagent_ids)];
 			if (ids.length !== params.subagent_ids.length) fail("invalid_arguments", "subagent_ids must not contain duplicates");
-			const snapshots = new Map<string, AgentSnapshot>();
-			for (const id of ids) snapshots.set(id, await requireOwnedChild(id, parentId, signal));
+			const snapshots = new Map<string, AgentSnapshot>(await Promise.all(
+				ids.map(async (id) => [id, await requireOwnedChild(id, parentId, signal)] as const),
+			));
 			const mode = params.mode ?? "all";
 			const waitMs = params.wait_ms ?? DEFAULT_WAIT_MS;
 			const byId = new Map((await listChildren(parentId, true, signal)).map((child) => [child.subagent_id, child]));
@@ -509,12 +628,16 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 				for (const [id, child] of outcome.children) byId.set(id, child);
 				timedOut = outcome.timedOut;
 			}
-			const outputLines = params.output_lines ?? DEFAULT_OUTPUT_LINES;
+			const includeActivity = params.include_activity === true;
 			const results = await Promise.all(ids.map(async (id) => {
 				const child = byId.get(id) ?? summarizeSnapshot(snapshots.get(id) as AgentSnapshot);
-				return { child, activity: await readActivity(child, outputLines, parentId, signal) };
+				return {
+					child,
+					activity: includeActivity ? await readActivity(child, params.output_lines ?? DEFAULT_OUTPUT_LINES, parentId, signal) : undefined,
+				};
 			}));
-			const text = results.map(({ child, activity }) => `${summaryText(child)}${waitNote(child, waitMs, timedOut)}\n\n${activity}`).join("\n\n---\n\n");
+			const blocks = results.map(({ child, activity }) => `${summaryText(child)}${waitNote(child, waitMs, timedOut)}${activity ? `\n\n${activity}` : ""}`).join("\n\n---\n\n");
+			const text = includeActivity ? blocks : `${blocks}${WAIT_SUMMARY_NOTE}`;
 			return {
 				content: [{ type: "text", text }],
 				details: { mode, timed_out: timedOut, summaries: results.map(({ child }) => child) },
@@ -528,7 +651,7 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 		label: "Subagent Stop",
 		description: "Interrupt a Paseo subagent, or terminate it by archiving it out of the parent's subagent track.",
 		parameters: Type.Object({
-			subagent_id: Type.String({ minLength: 1, maxLength: 128 }),
+			subagent_id: Type.String({ minLength: 1, maxLength: 128, description: "Subagent id or display name" }),
 			mode: Type.Union([Type.Literal("interrupt"), Type.Literal("terminate")]),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: SubagentStopParams, signal, _onUpdate, ctx) {
@@ -547,6 +670,90 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 			return {
 				content: [{ type: "text", text: `${summaryText(summary)} ${params.mode}: ${detail}` }],
 				details: { summary, mode: params.mode },
+			};
+		},
+		renderResult(result, _options, theme) { return renderSummary(result, theme); },
+	});
+
+	pi.registerTool({
+		name: "subagent_send",
+		label: "Subagent Send",
+		description: "Send a follow-up task to an existing subagent. The daemon steers or replaces the child's current run and the finish notification delivers the result, so do not poll. Sending to an archived subagent resumes it.",
+		promptSnippet: "Send follow-up work to an existing subagent",
+		promptGuidelines: [
+			"Prefer subagent_send over a second subagent_run when the new task depends on the child's accumulated context.",
+		],
+		parameters: Type.Object({
+			subagent_id: Type.String({ minLength: 1, maxLength: 128, description: "Subagent id or display name" }),
+			prompt: Type.String({ minLength: 1, maxLength: MAX_PROMPT_BYTES, description: "Follow-up task for the subagent" }),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params: SubagentSendParams, signal, _onUpdate, ctx) {
+			trusted(ctx);
+			const parentId = parentAgentId();
+			if (typeof params.prompt !== "string" || !params.prompt.trim()) fail("invalid_arguments", "prompt must not be empty");
+			if (Buffer.byteLength(params.prompt, "utf8") > MAX_PROMPT_BYTES) fail("invalid_arguments", "prompt is too large");
+			const snapshot = await requireOwnedChild(params.subagent_id, parentId, signal);
+			const result = await paseoMcp.callTool<{ success?: boolean; status?: string; guidance?: string }>(
+				"send_agent_prompt",
+				{ agentId: snapshot.id, prompt: params.prompt, background: true, notifyOnFinish: true },
+				{ callerAgentId: parentId, signal },
+			);
+			const summary = summarizeSnapshot(snapshot);
+			const detail = result.success === false ? "follow-up rejected" : `follow-up accepted, status=${result.status ?? "unknown"}`;
+			const resumeNote = snapshot.archived ? " (the archived subagent is resumed by this send)" : "";
+			return {
+				content: [{ type: "text", text: `${summaryText(summary)} ${detail}${resumeNote}` }],
+				details: { summary, status: result.status, ...(result.guidance ? { guidance: result.guidance } : {}) },
+			};
+		},
+		renderResult(result, _options, theme) { return renderSummary(result, theme); },
+	});
+
+	pi.registerTool({
+		name: "subagent_permit",
+		label: "Subagent Permit",
+		description: "List pending permission requests of this session's subagents, or answer one. Omit request_id to list. Answering requires subagent_id, request_id, and decision; a question request needs answer (allow) or comment (deny). Never auto-approves.",
+		promptSnippet: "List or answer a subagent's pending permission request",
+		promptGuidelines: [
+			"A subagent blocked on approval shows attention=permission and cannot progress until someone answers. List its request with subagent_permit, then answer allow or deny explicitly; deny when the request exceeds the delegated task scope.",
+		],
+		parameters: Type.Object({
+			subagent_id: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Subagent id or display name; required when answering" })),
+			request_id: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Request id from the listing; omit to list" })),
+			decision: Type.Optional(Type.Union([Type.Literal("allow"), Type.Literal("deny")], { description: "Required when answering" })),
+			answer: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_ANSWER_LENGTH, description: "Answer for a question request (allow): a listed option or free text" })),
+			comment: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_ANSWER_LENGTH, description: "Optional comment (allow) or reason (deny)" })),
+			action_id: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "A listed action id when the request offers more than a plain allow/deny" })),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params: SubagentPermitParams, signal, _onUpdate, ctx) {
+			trusted(ctx);
+			const parentId = parentAgentId();
+			if (!params.request_id) {
+				if (params.decision || params.answer || params.comment || params.action_id || params.subagent_id) {
+					fail("invalid_arguments", "answering requires request_id; omit it and the other fields to list pending requests");
+				}
+				const owned = new Set((await listChildren(parentId, true, signal)).map((child) => child.subagent_id));
+				const pending = parsePendingPermissions(
+					await paseoMcp.callTool<unknown>("list_pending_permissions", {}, { callerAgentId: parentId, signal }),
+					owned,
+				);
+				const text = pending.length
+					? pending.map(formatPendingPermission).join("\n\n")
+					: "No pending permission requests from this session's subagents";
+				return { content: [{ type: "text", text }], details: { pending } };
+			}
+			if (!params.subagent_id || !params.decision) {
+				fail("invalid_arguments", "answering a request requires subagent_id and decision");
+			}
+			const snapshot = await requireOwnedChild(params.subagent_id, parentId, signal);
+			await paseoMcp.callTool<{ success?: boolean }>("respond_to_permission", {
+				agentId: snapshot.id,
+				requestId: params.request_id,
+				response: permitResponse({ decision: params.decision, answer: params.answer, comment: params.comment, action_id: params.action_id }),
+			}, { callerAgentId: parentId, signal });
+			return {
+				content: [{ type: "text", text: `${snapshot.id} request ${params.request_id}: ${params.decision}${params.answer ? ` (${params.answer})` : ""}` }],
+				details: { subagent_id: snapshot.id, request_id: params.request_id, decision: params.decision },
 			};
 		},
 		renderResult(result, _options, theme) { return renderSummary(result, theme); },
@@ -592,6 +799,23 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 					ctx.ui.notify(profiles.length ? profiles.map((profile) => `${profile.name} -> ${providerSelector(profile.provider, profile.model)} ${JSON.stringify({ profile: profile.id })}`).join("\n") : "No agent profiles are configured in Paseo.", "info");
 					return;
 				}
+				if (action === "send" && id) {
+					const prompt = args.trim().split(/\s+/).slice(2).join(" ").trim();
+					if (!prompt) {
+						ctx.ui.notify("Usage: /subagent send <subagent_id> <prompt...>", "warning");
+						return;
+					}
+					const snapshot = await requireOwnedChild(id, parentId);
+					await paseoMcp.callTool<unknown>("send_agent_prompt", { agentId: snapshot.id, prompt, background: true, notifyOnFinish: true }, { callerAgentId: parentId });
+					ctx.ui.notify(`${snapshot.id} follow-up sent`, "info");
+					return;
+				}
+				if (action === "permit") {
+					const owned = new Set((await listChildren(parentId, true)).map((child) => child.subagent_id));
+					const pending = parsePendingPermissions(await paseoMcp.callTool<unknown>("list_pending_permissions", {}, { callerAgentId: parentId }), owned);
+					ctx.ui.notify(pending.length ? pending.map(formatPendingPermission).join("\n\n") : "No pending permission requests from this session's subagents", "info");
+					return;
+				}
 				if (id && (action === "read" || action === "interrupt" || action === "terminate")) {
 					const snapshot = await requireOwnedChild(id, parentId);
 					if (action === "read") ctx.ui.notify(await readActivity({ subagent_id: snapshot.id, archived: snapshot.archived }, DEFAULT_OUTPUT_LINES, parentId), "info");
@@ -604,7 +828,7 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 				return;
 			}
-			ctx.ui.notify("Usage: /subagent [list|read|interrupt|terminate|presets] [subagent_id]", "warning");
+			ctx.ui.notify("Usage: /subagent [list|read|send <id> <prompt>|interrupt <id>|terminate <id>|permit|presets] [subagent_id]", "warning");
 		},
 	});
 }

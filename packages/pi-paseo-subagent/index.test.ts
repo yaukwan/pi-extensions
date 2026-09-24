@@ -8,7 +8,9 @@ import { Check } from "typebox/value";
 import piPaseoSubagentExtension, {
 	buildInitialPrompt,
 	parseChildren,
+	parsePendingPermissions,
 	parseProfiles,
+	permitResponse,
 	providerSelector,
 	sessionKey,
 	splitProviderModel,
@@ -76,6 +78,31 @@ function childRow(overrides: Record<string, unknown> = {}) {
 	};
 }
 
+/** Pi `ask_user` surfaces as a question permission whose answer lives in `updatedInput.answers`. */
+function questionPermission(overrides: Record<string, unknown> = {}) {
+	return {
+		agentId: CHILD_ID,
+		status: "running",
+		request: {
+			id: "perm-1",
+			provider: "pi",
+			name: "Pi ask_user",
+			kind: "question",
+			title: "Which database should the migration target?",
+			input: {
+				questions: [{
+					question: "Which database should the migration target?",
+					header: "Response",
+					options: [{ label: "postgres" }, { label: "sqlite" }],
+					multiSelect: false,
+				}],
+			},
+			actions: [{ id: "act_allow", label: "Allow", behavior: "allow" }, { id: "act_deny", label: "Deny", behavior: "deny" }],
+		},
+		...overrides,
+	};
+}
+
 const PROFILES = {
 	profiles: [
 		{ id: "agent_profile_fast", name: "Fast Flash", provider: "pi", model: "h/deepseek-flash", thinkingOptionId: "low" },
@@ -95,7 +122,7 @@ interface RecordedCall {
 
 interface FakeDaemon {
 	calls: RecordedCall[];
-	state: { children: Array<Record<string, unknown>>; activity: string };
+	state: { children: Array<Record<string, unknown>>; activity: string; permissions: Array<Record<string, unknown>> };
 	respond: (call: RecordedCall) => unknown;
 }
 
@@ -117,6 +144,7 @@ function makeDaemon(overrides: { respond?: (call: RecordedCall, daemon: FakeDaem
 				childRow({ id: FOREIGN_ID, title: "someone else", labels: { "paseo.parent-agent-id": "another-parent" } }),
 			],
 			activity: "Showing all 2 activities\n\n[User] review the diff\ntwo real bugs found",
+			permissions: [],
 		},
 		respond: () => undefined,
 	};
@@ -150,6 +178,12 @@ function makeDaemon(overrides: { respond?: (call: RecordedCall, daemon: FakeDaem
 					permission: null,
 					guidance: "You will get notified when the created agent finishes.",
 				});
+			case "send_agent_prompt":
+				return ok({ success: true, status: "running", lastMessage: null, permission: null, guidance: "You will get notified when the prompted agent finishes." });
+			case "list_pending_permissions":
+				return ok({ permissions: daemon.state.permissions });
+			case "respond_to_permission":
+				return ok({ success: true });
 			case "cancel_agent":
 			case "archive_agent":
 				return ok({ success: true });
@@ -382,6 +416,42 @@ test("frames the child prompt with delegation instructions instead of a role", (
 	assert.ok(prompt.includes("You are a delegated Paseo subagent."));
 	assert.ok(prompt.includes("Task:\nRead-only: inspect the parser"));
 	assert.ok(!prompt.includes("Role:"));
+	// Shared workspace, no interactive user, and the parent-visible final message contract.
+	assert.match(prompt, /Do not revert, overwrite, or reformat edits outside your assigned scope\./);
+	assert.match(prompt, /Do not ask questions; make reasonable assumptions/);
+	assert.match(prompt, /truncated to about 4000 characters/);
+	assert.match(prompt, /the file paths you changed/);
+});
+
+test("notes permission blocks, timeouts, and idle waits", () => {
+	const blocked = waitNote({ subagent_id: "a", name: "x", status: "running", provider: "pi", attentionReason: "permission" }, 1000, false);
+	assert.match(blocked, /subagent_permit/);
+	assert.match(blocked, /paseo permit allow/);
+	assert.match(blocked, /keeps one concurrency slot/);
+	assert.match(waitNote({ subagent_id: "a", name: "x", status: "running", provider: "pi" }, 1000, true), /still running after 1000ms/);
+	assert.equal(waitNote({ subagent_id: "a", name: "x", status: "idle", provider: "pi" }, 1000, false), "");
+});
+
+test("answers question permissions through updatedInput.answers", () => {
+	assert.deepEqual(permitResponse({ decision: "allow", answer: "postgres" }), { behavior: "allow", updatedInput: { answers: { Response: "postgres" } } });
+	assert.deepEqual(permitResponse({ decision: "allow", answer: "postgres", comment: "already provisioned" }), {
+		behavior: "allow",
+		updatedInput: { answers: { Response: "postgres", Comment: "already provisioned" } },
+	});
+	// A bare allow stays a plain tool approval; it reads as a cancellation for question requests.
+	assert.deepEqual(permitResponse({ decision: "allow", action_id: "act_allow" }), { behavior: "allow", selectedActionId: "act_allow" });
+	assert.deepEqual(permitResponse({ decision: "deny", comment: "out of scope" }), { behavior: "deny", message: "out of scope" });
+});
+
+test("keeps only this session's pending permission requests", () => {
+	const owned = new Set([CHILD_ID]);
+	const rows = parsePendingPermissions(
+		{ permissions: [questionPermission(), questionPermission({ agentId: FOREIGN_ID })] },
+		owned,
+	);
+	assert.equal(rows.length, 1);
+	assert.equal((rows[0] as Record<string, unknown>).agentId, CHILD_ID);
+	assert.throws(() => parsePendingPermissions({}, owned), /paseo_invalid_output/);
 });
 
 test("maps paseo profiles and child rows", () => {
@@ -404,15 +474,9 @@ test("maps paseo profiles and child rows", () => {
 	assert.throws(() => parseChildren({}, PARENT_ID), /paseo_invalid_output/);
 });
 
-test("notes permission and timeout waits", () => {
-	assert.match(waitNote({ subagent_id: "a", name: "x", status: "running", provider: "pi", attentionReason: "permission" }, 1000, false), /paseo permit allow/);
-	assert.match(waitNote({ subagent_id: "a", name: "x", status: "running", provider: "pi" }, 1000, true), /still running after 1000ms/);
-	assert.equal(waitNote({ subagent_id: "a", name: "x", status: "idle", provider: "pi" }, 1000, false), "");
-});
-
 // --- tools ------------------------------------------------------------------
 
-test("registers the six subagent tools", () => {
+test("registers the eight subagent tools", () => {
 	const tools = registeredTools();
 	assert.deepEqual(tools.map((entry) => entry.name), [
 		"subagent_run",
@@ -420,6 +484,8 @@ test("registers the six subagent tools", () => {
 		"subagent_read",
 		"subagent_wait",
 		"subagent_stop",
+		"subagent_send",
+		"subagent_permit",
 		"subagent_presets",
 	]);
 	const runParams = tools.find((entry) => entry.name === "subagent_run")?.parameters?.properties;
@@ -432,6 +498,18 @@ test("registers the six subagent tools", () => {
 	for (const legacy of [{ target: "inherit" }, { provider: "openai" }, { role: "scout" }, { profile: "Reviewer", provider: "pi" }]) {
 		assert.equal(Check(runTool!.parameters!, { prompt: "task", ...legacy }), false);
 	}
+
+	// The delegation methodology reaches the system prompt, and wait transcripts stay opt-in.
+	const runGuidelines = (runTool as unknown as { promptGuidelines?: string[] }).promptGuidelines ?? [];
+	assert.ok(runGuidelines.some((guideline) => guideline.includes("disjoint file scopes")));
+	assert.ok(runGuidelines.some((guideline) => guideline.includes("never your conversation history")));
+	assert.ok(runGuidelines.some((guideline) => guideline.includes(`At most ${8} subagents can be active at once`)));
+	const waitTool = tools.find((entry) => entry.name === "subagent_wait");
+	assert.ok(waitTool?.parameters?.properties && "include_activity" in waitTool.parameters.properties);
+	const permitTool = tools.find((entry) => entry.name === "subagent_permit");
+	assert.ok(permitTool?.parameters?.properties && "answer" in permitTool.parameters.properties);
+	assert.equal(Check(permitTool!.parameters!, { subagent_id: "x", request_id: "r", decision: "allow", answer: "postgres" }), true);
+	assert.equal(Check(permitTool!.parameters!, { subagent_id: "x", request_id: "r", decision: "maybe" }), false);
 });
 
 test("inherits provider, model, and thinking from the calling agent", async () => {
@@ -519,14 +597,33 @@ test("rejects malformed profiles locally and never falls back for unknown ones",
 	});
 });
 
-test("caps concurrently active subagents", async () => {
+test("caps concurrently active subagents and names them", async () => {
 	const daemon = makeDaemon();
 	daemon.state.children = Array.from({ length: 8 }, (_, index) => childRow({ id: `child-${index}`, status: "running", requiresAttention: false, attentionReason: null }));
 	await withFakeDaemon(daemon, async () => {
 		await assert.rejects(
 			() => tool(registeredTools(), "subagent_run")("call", { prompt: "task" }, undefined, undefined, fakeContext()),
-			/too_many_active_subagents/,
+			(error: Error & { message: string }) => {
+				assert.match(error.message, /too_many_active_subagents: 8 subagents are still active/);
+				assert.match(error.message, /child-0 \[running\]/);
+				assert.match(error.message, /child-7 \[running\]/);
+				assert.match(error.message, /Stop one with subagent_stop/);
+				return true;
+			},
 		);
+	});
+});
+
+test("forwards a profile's modeId so cross-provider children can start", async () => {
+	const daemon = makeDaemon({
+		respond: (call) => (call.name === "list_profiles"
+			? ok({ profiles: [{ id: "agent_profile_codex", name: "Codex Full Access", provider: "codex", thinkingOptionId: "medium", modeId: "full-access" }] })
+			: undefined),
+	});
+	await withFakeDaemon(daemon, async () => {
+		await tool(registeredTools(), "subagent_run")("call", { prompt: "task", profile: "Codex Full Access" }, undefined, undefined, fakeContext());
+		const created = daemon.calls.find((call) => call.name === "create_agent");
+		assert.deepEqual(created?.args.settings, { thinkingOptionId: "medium", modeId: "full-access" });
 	});
 });
 
@@ -613,10 +710,117 @@ test("refuses a non-owned agent even though it exists", async () => {
 	});
 });
 
-test("waits for every child and reports their transcripts", async () => {
+test("addresses a child by display name when it is unique", async () => {
 	const daemon = makeDaemon();
 	await withFakeDaemon(daemon, async () => {
-		const result = await tool(registeredTools(), "subagent_wait")("call", { subagent_ids: [CHILD_ID, OTHER_CHILD_ID], wait_ms: 200 }, undefined, undefined, fakeContext()) as {
+		const result = await tool(registeredTools(), "subagent_read")("call", { subagent_id: "auth-review" }, undefined, undefined, fakeContext()) as { content: Array<{ text: string }> };
+		assert.match(result.content[0]?.text ?? "", /two real bugs found/);
+		// Failed id lookup, name scan, ownership check, then the read.
+		assert.deepEqual(toolNames(daemon.calls), ["get_agent_status", "list_agents", "get_agent_status", "get_agent_activity"]);
+	});
+});
+
+test("refuses an ambiguous display name and lists the candidates", async () => {
+	const daemon = makeDaemon();
+	daemon.state.children = [
+		childRow({ id: CHILD_ID, title: "task", status: "running" }),
+		childRow({ id: OTHER_CHILD_ID, title: "task", status: "running" }),
+	];
+	await withFakeDaemon(daemon, async () => {
+		await assert.rejects(
+			() => tool(registeredTools(), "subagent_read")("call", { subagent_id: "task" }, undefined, undefined, fakeContext()),
+			(error: Error) => {
+				assert.match(error.message, /ambiguous_subagent_name: "task" matches 2 subagents/);
+				assert.ok(error.message.includes(CHILD_ID) && error.message.includes(OTHER_CHILD_ID));
+				return true;
+			},
+		);
+	});
+});
+
+test("sends a follow-up task to an existing child", async () => {
+	const daemon = makeDaemon();
+	await withFakeDaemon(daemon, async () => {
+		const send = tool(registeredTools(), "subagent_send");
+		const result = await send("call", { subagent_id: CHILD_ID, prompt: "now check the parser" }, undefined, undefined, fakeContext()) as {
+			content: Array<{ text: string }>;
+			details: { status?: string; guidance?: string };
+		};
+		assert.match(result.content[0]?.text ?? "", /follow-up accepted, status=running/);
+		assert.match(result.details.guidance ?? "", /notified/);
+		assert.deepEqual(daemon.calls[1]?.args, { agentId: CHILD_ID, prompt: "now check the parser", background: true, notifyOnFinish: true });
+		await assert.rejects(() => send("call", { subagent_id: CHILD_ID, prompt: "   " }, undefined, undefined, fakeContext()), /invalid_arguments: prompt must not be empty/);
+	});
+});
+
+test("notes that sending to an archived child resumes it", async () => {
+	const daemon = makeDaemon({
+		respond: (call) => (call.name === "get_agent_status" && call.args.agentId === CHILD_ID
+			? ok({ status: "closed", snapshot: childSnapshot({ status: "closed", archivedAt: "2026-09-13T04:13:12.000Z" }) })
+			: undefined),
+	});
+	await withFakeDaemon(daemon, async () => {
+		const result = await tool(registeredTools(), "subagent_send")("call", { subagent_id: CHILD_ID, prompt: "resume work" }, undefined, undefined, fakeContext()) as { content: Array<{ text: string }> };
+		assert.match(result.content[0]?.text ?? "", /the archived subagent is resumed by this send/);
+	});
+});
+
+test("refuses to steer an agent it does not own", async () => {
+	const daemon = makeDaemon({
+		respond: (call) => (call.name === "get_agent_status"
+			? ok({ status: "idle", snapshot: childSnapshot({ id: FOREIGN_ID, labels: { "paseo.parent-agent-id": "another-parent" } }) })
+			: undefined),
+	});
+	await withFakeDaemon(daemon, async () => {
+		await assert.rejects(
+			() => tool(registeredTools(), "subagent_send")("call", { subagent_id: FOREIGN_ID, prompt: "steal" }, undefined, undefined, fakeContext()),
+			/subagent_not_found: .* is not a subagent/,
+		);
+		assert.deepEqual(daemon.calls.filter((call) => call.name === "send_agent_prompt"), []);
+	});
+});
+
+test("lists only the pending permissions of owned children", async () => {
+	const daemon = makeDaemon();
+	daemon.state.permissions = [questionPermission(), questionPermission({ agentId: FOREIGN_ID })];
+	await withFakeDaemon(daemon, async () => {
+		const result = await tool(registeredTools(), "subagent_permit")("call", {}, undefined, undefined, fakeContext()) as {
+			content: Array<{ text: string }>;
+			details: { pending: unknown[] };
+		};
+		assert.equal(result.details.pending.length, 1);
+		const text = result.content[0]?.text ?? "";
+		assert.match(text, /request=perm-1 kind=question/);
+		assert.match(text, /options: postgres \| sqlite/);
+		assert.match(text, /actions: act_allow=Allow\(allow\), act_deny=Deny\(deny\)/);
+		assert.ok(!text.includes(FOREIGN_ID));
+	});
+});
+
+test("answers a question permission and a plain approval", async () => {
+	const daemon = makeDaemon();
+	await withFakeDaemon(daemon, async () => {
+		const permit = tool(registeredTools(), "subagent_permit");
+		const allowed = await permit("call", { subagent_id: CHILD_ID, request_id: "perm-1", decision: "allow", answer: "postgres" }, undefined, undefined, fakeContext()) as { content: Array<{ text: string }> };
+		assert.match(allowed.content[0]?.text ?? "", /request perm-1: allow \(postgres\)/);
+		assert.deepEqual(daemon.calls[1]?.args, {
+			agentId: CHILD_ID,
+			requestId: "perm-1",
+			response: { behavior: "allow", updatedInput: { answers: { Response: "postgres" } } },
+		});
+
+		await permit("call", { subagent_id: CHILD_ID, request_id: "perm-1", decision: "deny", comment: "out of scope" }, undefined, undefined, fakeContext());
+		assert.deepEqual(daemon.calls[3]?.args, { agentId: CHILD_ID, requestId: "perm-1", response: { behavior: "deny", message: "out of scope" } });
+
+		await assert.rejects(() => permit("call", { decision: "allow" }, undefined, undefined, fakeContext()), /invalid_arguments: answering requires request_id/);
+		await assert.rejects(() => permit("call", { subagent_id: CHILD_ID, request_id: "perm-1" }, undefined, undefined, fakeContext()), /invalid_arguments: answering a request requires subagent_id and decision/);
+	});
+});
+
+test("waits for every child and reports their transcripts when asked", async () => {
+	const daemon = makeDaemon();
+	await withFakeDaemon(daemon, async () => {
+		const result = await tool(registeredTools(), "subagent_wait")("call", { subagent_ids: [CHILD_ID, OTHER_CHILD_ID], wait_ms: 200, include_activity: true }, undefined, undefined, fakeContext()) as {
 			content: Array<{ text: string }>;
 			details: { timed_out: boolean; summaries: unknown[] };
 		};
@@ -628,6 +832,21 @@ test("waits for every child and reports their transcripts", async () => {
 	});
 });
 
+test("waits return state only unless transcripts are requested", async () => {
+	const daemon = makeDaemon();
+	await withFakeDaemon(daemon, async () => {
+		const result = await tool(registeredTools(), "subagent_wait")("call", { subagent_ids: [CHILD_ID, OTHER_CHILD_ID], wait_ms: 120 }, undefined, undefined, fakeContext()) as { content: Array<{ text: string }> };
+		// The finish notification already delivers each child's final message, so no transcript is fetched.
+		assert.deepEqual(daemon.calls.filter((call) => call.name === "get_agent_activity"), []);
+		assert.match(result.content[0]?.text ?? "", /activity omitted: Paseo's finish notification delivers/);
+		assert.match(result.content[0]?.text ?? "", new RegExp(`${CHILD_ID} \\[idle\\] auth-review attention=finished`));
+
+		// The fallback poll backs off instead of hammering list_agents at a fixed rate.
+		const polls = daemon.calls.filter((call) => call.name === "list_agents").length;
+		assert.ok(polls <= 8, `expected backoff, saw ${polls} polls`);
+	});
+});
+
 test("reads no transcript for an archived child during a wait", async () => {
 	const daemon = makeDaemon();
 	daemon.state.children = [
@@ -635,7 +854,7 @@ test("reads no transcript for an archived child during a wait", async () => {
 		childRow({ id: OTHER_CHILD_ID, title: "parser audit", status: "running", requiresAttention: false, attentionReason: null }),
 	];
 	await withFakeDaemon(daemon, async () => {
-		const result = await tool(registeredTools(), "subagent_wait")("call", { subagent_ids: [CHILD_ID, OTHER_CHILD_ID], wait_ms: 200 }, undefined, undefined, fakeContext()) as { content: Array<{ text: string }> };
+		const result = await tool(registeredTools(), "subagent_wait")("call", { subagent_ids: [CHILD_ID, OTHER_CHILD_ID], wait_ms: 200, include_activity: true }, undefined, undefined, fakeContext()) as { content: Array<{ text: string }> };
 		// The archived child is skipped, so `get_agent_activity` only reaches the running one.
 		assert.deepEqual(daemon.calls.filter((call) => call.name === "get_agent_activity").map((call) => call.args.agentId), [OTHER_CHILD_ID]);
 		assert.match(result.content[0]?.text ?? "", /archived: this subagent was removed from the track/);
