@@ -25,7 +25,7 @@ Requires a Pi session running inside a Paseo agent (`PASEO_AGENT_ID` is set by t
 | --- | --- |
 | `background_exec` | `{command, cwd?, label?, session?}`. Type a command and return a `task_id` after sending input. `cwd` applies only when creating a terminal. |
 | `background_list` | `{task_id?, cursor?, limit?}`. List submissions with terminal state (`open` / `closed`). Daemon errors propagate. |
-| `background_read` | `{task_id, output_lines?}`. Capture recent rendered lines, including command echoes, prompts, and shared session history. |
+| `background_read` | `{task_id, output_lines?, from_line?}`. Capture recent rendered lines, including command echoes, prompts, and shared session history. `from_line` enables incremental reading from a 1-based line offset. |
 | `background_write` | `{task_id, input, submit?}`. Send input to the foreground program or shell; `submit: false` skips Enter. |
 | `background_stop` | `{task_id, mode}`. `interrupt` sends Ctrl-C without claiming completion; `terminate` closes the shared terminal. |
 
