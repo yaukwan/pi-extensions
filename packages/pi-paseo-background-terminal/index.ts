@@ -38,6 +38,12 @@ const DEFAULT_OUTPUT_LINES = 120;
 /** Paseo terminals each own a PTY and a shell; keep the per-project fan-out modest. */
 const MAX_ACTIVE_SESSIONS = 16;
 
+export interface BackgroundExecResult {
+	task_id: string;
+	summary: TaskSummary;
+	warning?: string;
+}
+
 export interface BackgroundListResult {
 	tasks: TaskSummary[];
 	next_cursor?: string;
@@ -143,7 +149,7 @@ export class PaseoBackgroundTerminalService {
 		return new Set(terminals.map((terminal) => terminal.id));
 	}
 
-	async exec(params: BackgroundExecParams, ctx: ExtensionContext, signal?: AbortSignal): Promise<{ task_id: string; summary: TaskSummary }> {
+	async exec(params: BackgroundExecParams, ctx: ExtensionContext, signal?: AbortSignal): Promise<BackgroundExecResult> {
 		assertProjectTrusted(ctx);
 		assertExecParams(params);
 		const callerAgentId = parentAgentId();
@@ -191,7 +197,10 @@ export class PaseoBackgroundTerminalService {
 			throw error;
 		}
 		const summary: TaskSummary = { ...meta, state: "open" };
-		return { task_id: meta.task_id, summary };
+		const warning = params.session
+			? "Session reused. If a foreground process is still running, this command was sent as stdin to it. Verify readiness with background_read before continuing."
+			: undefined;
+		return { task_id: meta.task_id, summary, ...(warning ? { warning } : {}) };
 	}
 
 	async list(params: BackgroundListParams, ctx: ExtensionContext): Promise<BackgroundListResult> {
@@ -222,9 +231,27 @@ export class PaseoBackgroundTerminalService {
 			callerAgentId: parentAgentId(),
 			signal,
 		});
+
+		if (params.from_line !== undefined) {
+			const startIdx = params.from_line - 1;
+			if (startIdx >= capture.lines.length) {
+				return `[no new output; terminal line ${capture.lines.length} of ${capture.totalLines}]`;
+			}
+			const sliced = capture.lines.slice(startIdx, startIdx + lines);
+			const endLine = startIdx + sliced.length;
+			const text = trimTrailingBlanks(sliced).join("\n");
+			const result = truncateTail(text, { maxLines: lines, maxBytes: DEFAULT_MAX_BYTES });
+			const content = result.truncated ? `[older terminal output omitted]\n${result.content}` : result.content;
+			return `${content}\n[terminal line ${endLine} of ${capture.totalLines}]`;
+		}
+
 		const text = trimTrailingBlanks(capture.lines).slice(-lines).join("\n");
 		const result = truncateTail(text, { maxLines: lines, maxBytes: DEFAULT_MAX_BYTES });
-		return result.truncated ? `[older terminal output omitted]\n${result.content}` : result.content;
+		if (result.truncated) {
+			const returnedLines = result.content.split("\n").length;
+			return `[showing last ${returnedLines} of ${capture.totalLines} lines in Paseo scrollback; older output omitted]\n${result.content}`;
+		}
+		return result.content;
 	}
 
 	async write(params: BackgroundWriteParams, ctx: ExtensionContext, signal?: AbortSignal): Promise<BackgroundWriteResult> {
@@ -318,7 +345,8 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: BackgroundExecParams, signal, _onUpdate, ctx) {
 			const result = await service.exec(params, ctx, signal);
-			return { content: [{ type: "text", text: result.task_id }], details: result };
+			const text = result.warning ? `${result.task_id}\nWarning: ${result.warning}` : result.task_id;
+			return { content: [{ type: "text", text }], details: result };
 		},
 		renderCall(args, theme) {
 			const input = args as Partial<BackgroundExecParams>;
@@ -358,6 +386,7 @@ export default function paseoBackgroundTerminalExtension(pi: ExtensionAPI): void
 		parameters: Type.Object({
 			task_id: Type.String({ minLength: 1, maxLength: 128 }),
 			output_lines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_OUTPUT_LINES })),
+			from_line: Type.Optional(Type.Integer({ minimum: 1, description: "1-based starting line number for incremental reading" })),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params: BackgroundReadParams, signal, _onUpdate, ctx) {
 			return { content: [{ type: "text", text: await service.read(params, ctx, signal) }], details: undefined };

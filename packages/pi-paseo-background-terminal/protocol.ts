@@ -14,6 +14,7 @@ export type BackgroundListParams = {
 export type BackgroundReadParams = {
 	task_id: string;
 	output_lines?: number;
+	from_line?: number;
 };
 
 export type BackgroundWriteParams = {
@@ -79,10 +80,13 @@ export function assertExecParams(params: BackgroundExecParams): void {
 }
 
 export function assertReadParams(params: BackgroundReadParams): void {
-	assertKeys(params, ["task_id", "output_lines"]);
+	assertKeys(params, ["task_id", "output_lines", "from_line"]);
 	assertTaskId(params.task_id);
 	if (params.output_lines !== undefined && (!Number.isInteger(params.output_lines) || params.output_lines < 1 || params.output_lines > MAX_OUTPUT_LINES)) {
 		throw new Error(`invalid_arguments: output_lines must be 1-${MAX_OUTPUT_LINES}.`);
+	}
+	if (params.from_line !== undefined && (!Number.isInteger(params.from_line) || params.from_line < 1)) {
+		throw new Error("invalid_arguments: from_line must be an integer >= 1.");
 	}
 }
 

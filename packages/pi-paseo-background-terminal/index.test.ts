@@ -79,9 +79,19 @@ test("reads capture the shared terminal snapshot with line and byte bounds", asy
 	fake.captures.set(summary.terminal_id, ["$ printf hello", "hello", "$", "", ""]);
 	assert.equal(await service.read({ task_id, output_lines: 2 }, ctx), "hello\n$");
 	assert.equal(await service.read({ task_id, output_lines: 2 }, ctx), "hello\n$", "reads do not consume a cursor");
+
+	// from_line incremental reading
+	const inc1 = await service.read({ task_id, from_line: 1, output_lines: 2 }, ctx);
+	assert.equal(inc1, "$ printf hello\nhello\n[terminal line 2 of 5]");
+	const inc2 = await service.read({ task_id, from_line: 3, output_lines: 2 }, ctx);
+	assert.equal(inc2, "$\n[terminal line 4 of 5]");
+	const incEmpty = await service.read({ task_id, from_line: 10 }, ctx);
+	assert.equal(incEmpty, "[no new output; terminal line 5 of 5]");
+
 	fake.captures.set(summary.terminal_id, ["x".repeat(100_000), "tail"]);
 	const bounded = await service.read({ task_id }, ctx);
 	assert.ok(Buffer.byteLength(bounded) < 52_000);
+	assert.ok(bounded.includes("lines in Paseo scrollback; older output omitted"));
 	assert.ok(bounded.endsWith("tail"));
 	await service.stop({ task_id, mode: "terminate" }, ctx);
 	await assert.rejects(service.read({ task_id }, ctx), /not found/);
@@ -90,8 +100,10 @@ test("reads capture the shared terminal snapshot with line and byte bounds", asy
 test("session reuse sends input directly and rejects cwd overrides or missing terminals", async (t) => {
 	const { fake, ctx, service } = await fixture(t);
 	const first = await service.exec({ command: "export SHARED=one" }, ctx);
+	assert.equal(first.warning, undefined);
 	const second = await service.exec({ command: "echo $SHARED", session: first.task_id }, ctx);
 	assert.equal(second.summary.terminal_id, first.summary.terminal_id);
+	assert.ok(second.warning?.includes("Session reused"));
 	assert.equal(fake.terminals.size, 1);
 	assert.equal(fake.keys[2]?.keys, "echo $SHARED");
 	await assert.rejects(service.exec({ command: "pwd", session: first.task_id, cwd: "." }, ctx), /cwd only applies/);
@@ -200,6 +212,7 @@ test("validation rejects stale options, control input, unsafe ids and untrusted 
 	assert.throws(() => assertExecParams({ command: "中".repeat(30_000) }), /UTF-8 bytes/);
 	for (const id of ["../other", "t-../../other", "", "x".repeat(129)]) assert.throws(() => assertTaskId(id), /invalid_arguments/);
 	for (const output_lines of [0, 2001, NaN, 1.5]) assert.throws(() => assertReadParams({ task_id: "t-a", output_lines }), /output_lines/);
+	for (const from_line of [0, -1, NaN, 1.5]) assert.throws(() => assertReadParams({ task_id: "t-a", from_line }), /from_line/);
 	assert.throws(() => assertWriteParams({ task_id: "t-a", input: "x", submit: "yes" } as never), /submit/);
 	assert.throws(() => assertStopParams({ task_id: "t-a", mode: "kill" } as never), /mode/);
 	await assert.rejects(service.exec({ command: "true", cwd: ".." }, ctx), /cwd must stay/);
@@ -216,7 +229,7 @@ test("tool schemas expose direct terminal operations without old log or wait opt
 	assert.deepEqual(tools.map((tool) => tool.name), ["background_exec", "background_list", "background_read", "background_write", "background_stop"]);
 	assert.deepEqual(commands, ["bg"]);
 	assert.deepEqual(Object.keys(tools[0].parameters.properties), ["command", "cwd", "label", "session"]);
-	assert.deepEqual(Object.keys(tools[2].parameters.properties), ["task_id", "output_lines"]);
+	assert.deepEqual(Object.keys(tools[2].parameters.properties), ["task_id", "output_lines", "from_line"]);
 	assert.equal(tools[0].parameters.additionalProperties, false);
 	assert.match(taskSummaryText({ task_id: "t-a", label: "x", state: "open" } as never), /terminal open/);
 });
