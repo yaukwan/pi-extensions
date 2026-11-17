@@ -928,3 +928,16 @@ test("reports an empty profile list", async () => {
 		assert.match(result.content[0]?.text ?? "", /No agent profiles are configured/);
 	});
 });
+
+test("keeps waiting for a running child that list_agents leaves out", async () => {
+	const daemon = makeDaemon();
+	// A full page of archived rows pushes running children past the 200-row `list_agents` cap.
+	daemon.state.children = [childRow({ status: "closed", archivedAt: "2026-09-13T04:13:12.000Z" })];
+	await withFakeDaemon(daemon, async () => {
+		const result = await tool(registeredTools(), "subagent_wait")("call", { subagent_ids: [OTHER_CHILD_ID], wait_ms: 60 }, undefined, undefined, fakeContext()) as {
+			details: { timed_out: boolean; summaries: Array<{ status: string }> };
+		};
+		assert.equal(result.details.timed_out, true);
+		assert.equal(result.details.summaries[0]?.status, "running");
+	});
+});

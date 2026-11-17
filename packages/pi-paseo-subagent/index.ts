@@ -373,15 +373,30 @@ interface PollOutcome {
 	timedOut: boolean;
 }
 
-async function pollChildren(ids: string[], mode: "all" | "any", waitMs: number, parentId: string, signal?: AbortSignal): Promise<PollOutcome> {
+/** `list_agents` caps at 200 rows and can leave running children out once archived rows fill the page, so a
+ * requested child it omits is looked up directly instead of being read as settled. A deleted child stays missing. */
+async function childrenById(ids: string[], parentId: string, signal?: AbortSignal): Promise<Map<string, SubagentSummary>> {
 	const wanted = new Set(ids);
+	const byId = new Map((await listChildren(parentId, true, signal)).filter((child) => wanted.has(child.subagent_id)).map((child) => [child.subagent_id, child]));
+	for (const id of ids) {
+		if (byId.has(id)) continue;
+		try {
+			byId.set(id, summarizeSnapshot(await getAgentSnapshot(id, parentId, signal)));
+		} catch (error) {
+			if (!(error instanceof Error && error.message.startsWith("subagent_not_found"))) throw error;
+		}
+	}
+	return byId;
+}
+
+async function pollChildren(ids: string[], mode: "all" | "any", waitMs: number, parentId: string, signal?: AbortSignal): Promise<PollOutcome> {
 	const deadline = Date.now() + waitMs;
 	let children = new Map<string, SubagentSummary>();
 	// Back off from the base interval instead of hammering `list_agents`: the finish notification
 	// already delivers settled children, so this loop is only a fallback.
 	let attempt = 0;
 	for (;;) {
-		children = new Map((await listChildren(parentId, true, signal)).filter((child) => wanted.has(child.subagent_id)).map((child) => [child.subagent_id, child]));
+		children = await childrenById(ids, parentId, signal);
 		const settled = ids.filter((id) => {
 			const child = children.get(id);
 			return !child || isSettled(child);
@@ -612,7 +627,7 @@ export default function piPaseoSubagentExtension(pi: ExtensionAPI): void {
 			));
 			const mode = params.mode ?? "all";
 			const waitMs = params.wait_ms ?? DEFAULT_WAIT_MS;
-			const byId = new Map((await listChildren(parentId, true, signal)).map((child) => [child.subagent_id, child]));
+			const byId = await childrenById(ids, parentId, signal);
 			const pending = ids.filter((id) => {
 				const child = byId.get(id);
 				return child ? !isSettled(child) : false;
